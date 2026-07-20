@@ -47,11 +47,11 @@ func main() {
 
 	corsMiddleware := func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			allowedOrigin := cfg.AllowedOrigin
 			origin := r.Header.Get("Origin")
-			if origin != "" {
+
+			if origin == allowedOrigin || allowedOrigin == "" {
 				w.Header().Set("Access-Control-Allow-Origin", origin)
-			} else {
-				w.Header().Set("Access-Control-Allow-Origin", "*")
 			}
 
 			w.Header().Set("Access-Control-Allow-Credentials", "true")

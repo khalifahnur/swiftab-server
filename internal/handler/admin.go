@@ -130,16 +130,17 @@ func (h *AdminHandler) LoginAdmin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	isProd := false
+	isProd := true
 
 	cookie := &http.Cookie{
 		Name:     "access_token",
 		Value:    tokenString,
 		Path:     "/",
 		MaxAge:   24 * 60 * 60,
+		Domain:   ".swiftab.co.ke",
 		HttpOnly: true,
 		Secure:   isProd,
-		SameSite: http.SameSiteLaxMode, // Change to SameSiteNoneMode if cross-domain in prod
+		SameSite: http.SameSiteNoneMode,
 	}
 
 	if isProd {
