@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 
 	"swiftab/server/internal/config"
@@ -47,17 +48,29 @@ func main() {
 
 	corsMiddleware := func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			allowedOrigin := cfg.AllowedOrigin
 			origin := r.Header.Get("Origin")
+			envOrigin := strings.TrimRight(cfg.AllowedOrigin, "/")
+			allowedOrigins := []string{
+				envOrigin,
+				"https://www.swiftab.co.ke",
+				"https://swiftab.co.ke",
+				//  "http://localhost:3000",
+			}
 
-			if origin == allowedOrigin || allowedOrigin == "" {
+			isAllowed := false
+			for _, o := range allowedOrigins {
+				if origin == o {
+					isAllowed = true
+					break
+				}
+			}
+			if isAllowed || envOrigin == "" {
 				w.Header().Set("Access-Control-Allow-Origin", origin)
 			}
 
 			w.Header().Set("Access-Control-Allow-Credentials", "true")
 			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
-			w.Header().Set("Access-Control-Allow-Headers", "Content-Type, X-Requested-With, X-Admin-ID, X-Restaurant-ID")
-
+			w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Requested-With, X-Admin-ID, X-Restaurant-ID")
 			if r.Method == http.MethodOptions {
 				w.WriteHeader(http.StatusOK)
 				return
