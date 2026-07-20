@@ -79,11 +79,10 @@ func (h *OrderHandler) CreateOrder(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	resID, err1 := bson.ObjectIDFromHex(req.ReservationID)
 	restID, err2 := bson.ObjectIDFromHex(req.RestaurantID)
 	userID, err3 := bson.ObjectIDFromHex(req.UserID)
 
-	if err1 != nil || err2 != nil || err3 != nil {
+	if err2 != nil || err3 != nil {
 		util.JsonError(w, http.StatusBadRequest, "Invalid ID formats")
 		return
 	}
@@ -132,7 +131,7 @@ func (h *OrderHandler) CreateOrder(w http.ResponseWriter, r *http.Request) {
 		RestaurantName: req.RestaurantName,
 		UserID:         userID,
 		RestaurantID:   restID,
-		ReservationID:  resID,
+		ReservationID:  req.ReservationID,
 		TableNumber:    req.TableNumber,
 		Items:          req.Menu,
 		TotalAmount:    newItemsTotal,
@@ -354,7 +353,7 @@ func (h *OrderHandler) UpdateOrderStatus(w http.ResponseWriter, r *http.Request)
 
 	var reqBody struct {
 		OrderStatus string `json:"orderStatus"`
-		ServedBy    string `json:"servedBy"` // Waiter ID
+		ServedBy    string `json:"servedBy"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&reqBody); err != nil {
 		util.JsonError(w, http.StatusBadRequest, "Invalid request body")

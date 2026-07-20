@@ -223,3 +223,37 @@ func (h *TableHandler) SaveTables(w http.ResponseWriter, r *http.Request) {
 		"tables":  layout.TablePosition,
 	})
 }
+
+func (h *TableHandler) FetchRestaurantTable(w http.ResponseWriter, r *http.Request) {
+	restaurantIDStr := r.PathValue("restaurantId")
+	if restaurantIDStr == "" {
+		util.JsonError(w, http.StatusBadRequest, "Invalid or missing restaurantId")
+		return
+	}
+
+	objID, err := bson.ObjectIDFromHex(restaurantIDStr)
+	if err != nil {
+		util.JsonError(w, http.StatusBadRequest, "Invalid restaurantId format")
+		return
+	}
+
+	// We use bson.M to easily catch the dynamic structure of the layout without strict types
+	var layoutData bson.M
+
+	err = h.DB.Collection("restaurantlayouts").FindOne(r.Context(), bson.M{"_id": objID}).Decode(&layoutData)
+
+	if err != nil {
+		if err == mongo.ErrNoDocuments {
+			util.JsonError(w, http.StatusNotFound, "Tables not found for this restaurant")
+			return
+		}
+		util.JsonError(w, http.StatusInternalServerError, "Server error")
+		return
+	}
+
+	// Return the formatted response
+	util.JsonResponse(w, http.StatusOK, map[string]interface{}{
+		"message":              "Fetched tables successfully",
+		"restaurantLayoutData": layoutData,
+	})
+}

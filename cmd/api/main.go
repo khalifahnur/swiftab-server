@@ -54,7 +54,7 @@ func main() {
 				envOrigin,
 				"https://www.swiftab.co.ke",
 				"https://swiftab.co.ke",
-				//  "http://localhost:3000",
+				//"http://localhost:3000",
 			}
 
 			isAllowed := false
@@ -114,16 +114,22 @@ func main() {
 	mux.Handle("GET /api/v2/admin/orders", middleware.AuthMiddleware(http.HandlerFunc(orderHandler.FetchAllOrder)))
 	mux.Handle("GET /api/v2/admin/reservations", middleware.AuthMiddleware(http.HandlerFunc(reserveHandler.FetchReservations)))
 
-	mux.Handle("POST /api/v2/users/{userId}/restaurants/{restaurantId}/reservations", middleware.AuthMiddleware(http.HandlerFunc(reserveHandler.CreateReservation)))
-	mux.Handle("GET /api/v2/users/{userId}/reservations/active", middleware.AuthMiddleware(http.HandlerFunc(reserveHandler.UserActiveReservation)))
-	mux.Handle("GET /api/v2/users/{userId}/reservations/completed", middleware.AuthMiddleware(http.HandlerFunc(reserveHandler.UserCompletedReservation)))
-	mux.Handle("POST /api/v2/users/orders", middleware.AuthMiddleware(http.HandlerFunc(orderHandler.CreateOrder)))
-	mux.Handle("GET /api/v2/users/{userId}/orders", middleware.AuthMiddleware(http.HandlerFunc(orderHandler.GetUserOrders)))
-	mux.Handle("PUT /api/v2/users/orders/{orderId}/complete", middleware.AuthMiddleware(http.HandlerFunc(orderHandler.UserCompleteOrder)))
+	mux.Handle("POST /api/v2/users/{userId}/restaurants/{restaurantId}/reservations", http.HandlerFunc(reserveHandler.CreateReservation))
+	mux.Handle("GET /api/v2/users/{userId}/reservations/active", http.HandlerFunc(reserveHandler.UserActiveReservation))
+	mux.Handle("GET /api/v2/users/{userId}/reservations/completed", http.HandlerFunc(reserveHandler.UserCompletedReservation))
+	mux.Handle("POST /api/v2/users/{userId}/reservations/cancel", http.HandlerFunc(reserveHandler.UpdateStatusByUser))
 
-	mux.Handle("GET /api/v2/waiters/restaurants/{restaurantId}/orders", middleware.AuthMiddleware(http.HandlerFunc(orderHandler.GetWaiterOrders)))
-	mux.Handle("PUT /api/v2/waiters/orders/{orderId}/status", middleware.AuthMiddleware(http.HandlerFunc(orderHandler.UpdateOrderStatus)))
-	mux.Handle("PUT /api/v2/waiters/orders/{orderId}/complete", middleware.AuthMiddleware(http.HandlerFunc(orderHandler.WaiterCompleteOrder)))
+	mux.Handle("POST /api/v2/users/orders", http.HandlerFunc(orderHandler.CreateOrder))
+	mux.Handle("GET /api/v2/users/{userId}/orders", http.HandlerFunc(orderHandler.GetUserOrders))
+	mux.Handle("PUT /api/v2/users/orders/{orderId}/complete", http.HandlerFunc(orderHandler.UserCompleteOrder))
+
+	mux.Handle("GET /api/v2/users/restaurants", http.HandlerFunc(userHandler.FetchAllRestaurants))
+	mux.Handle("GET /api/v2/restaurants/{restaurantId}/menu", http.HandlerFunc(menuHandler.GetMenuByRestaurantID))
+	mux.Handle("GET /api/v2/restaurants/{restaurantId}/tables", http.HandlerFunc(tableHandler.FetchResTable))
+
+	mux.Handle("GET /api/v2/waiters/restaurants/{restaurantId}/orders", http.HandlerFunc(orderHandler.GetWaiterOrders))
+	mux.Handle("PUT /api/v2/waiters/orders/{orderId}/status", http.HandlerFunc(orderHandler.UpdateOrderStatus))
+	mux.Handle("PUT /api/v2/waiters/orders/{orderId}/complete", http.HandlerFunc(orderHandler.WaiterCompleteOrder))
 
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")

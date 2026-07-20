@@ -102,17 +102,14 @@ func (h *UserHandler) LoginUser(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Generate JWT using the newly added utility function
 	tokenString, err := util.GenerateUserToken(user.ID.Hex(), user.Email, 24*time.Hour)
 	if err != nil {
 		util.JsonError(w, http.StatusInternalServerError, "Error occurred during login")
 		return
 	}
 
-	// Send Email Asynchronously
 	go sendSigninEmail(user.Email)
 
-	// Return response exactly matching your Express payload
 	util.JsonResponse(w, http.StatusOK, map[string]interface{}{
 		"token": tokenString,
 		"user": map[string]string{
@@ -121,5 +118,28 @@ func (h *UserHandler) LoginUser(w http.ResponseWriter, r *http.Request) {
 			"email":       user.Email,
 			"phoneNumber": user.PhoneNumber,
 		},
+	})
+}
+
+func (h *UserHandler) FetchAllRestaurants(w http.ResponseWriter, r *http.Request) {
+	cursor, err := h.DB.Collection("restaurants").Find(r.Context(), bson.M{})
+	if err != nil {
+		util.JsonError(w, http.StatusInternalServerError, "Failed to fetch restaurants")
+		return
+	}
+	defer cursor.Close(r.Context())
+	var restaurants []bson.M
+	if err = cursor.All(r.Context(), &restaurants); err != nil {
+		util.JsonError(w, http.StatusInternalServerError, "Failed to parse restaurants data")
+		return
+	}
+
+	if restaurants == nil {
+		restaurants = []bson.M{}
+	}
+
+	util.JsonResponse(w, http.StatusOK, map[string]interface{}{
+		"message":     "restaurants fetched successfully",
+		"restaurants": restaurants,
 	})
 }

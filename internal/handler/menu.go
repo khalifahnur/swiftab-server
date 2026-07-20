@@ -247,3 +247,42 @@ func (h *MenuHandler) GetMenu(w http.ResponseWriter, r *http.Request) {
 
 	util.JsonResponse(w, http.StatusOK, restaurant.Data[0].Menu)
 }
+
+func (h *MenuHandler) GetMenuByRestaurantID(w http.ResponseWriter, r *http.Request) {
+	restaurantIDStr := r.PathValue("restaurantId")
+	if restaurantIDStr == "" {
+		util.JsonError(w, http.StatusBadRequest, "Invalid or missing restaurantId")
+		return
+	}
+
+	objID, err := bson.ObjectIDFromHex(restaurantIDStr)
+	if err != nil {
+		util.JsonError(w, http.StatusBadRequest, "Invalid Restaurant ID format")
+		return
+	}
+
+	var restaurantDoc struct {
+		Data []struct {
+			Menu bson.M `bson:"menu"`
+		} `bson:"data"`
+	}
+
+	opts := options.FindOne().SetProjection(bson.M{"data.menu": 1})
+
+	err = h.DB.Collection("restaurants").FindOne(r.Context(), bson.M{"_id": objID}, opts).Decode(&restaurantDoc)
+
+	if err != nil {
+		if err == mongo.ErrNoDocuments {
+			util.JsonError(w, http.StatusNotFound, "Restaurant not found")
+			return
+		}
+		util.JsonError(w, http.StatusInternalServerError, "Server error retrieving menu")
+		return
+	}
+
+	if len(restaurantDoc.Data) == 0 || restaurantDoc.Data[0].Menu == nil {
+		util.JsonError(w, http.StatusNotFound, "Menu not found for this restaurant")
+		return
+	}
+	util.JsonResponse(w, http.StatusOK, restaurantDoc.Data[0].Menu)
+}

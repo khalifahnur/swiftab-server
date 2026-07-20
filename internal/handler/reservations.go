@@ -408,7 +408,7 @@ func (h *ReservationHandler) CheckAvailability(w http.ResponseWriter, r *http.Re
 	}
 
 	var layout models.RestaurantLayout
-	err = h.DB.Collection("restaurantlayouts").FindOne(r.Context(), bson.M{"restaurantId": restID}).Decode(&layout)
+	err = h.DB.Collection("restaurantlayouts").FindOne(r.Context(), bson.M{"_id": restID}).Decode(&layout)
 	if err != nil {
 		util.JsonError(w, http.StatusInternalServerError, "Could not fetch restaurant layout")
 		return
@@ -438,4 +438,66 @@ func (h *ReservationHandler) CheckAvailability(w http.ResponseWriter, r *http.Re
 		"availability": availability,
 		"tables":       tables,
 	})
+}
+
+func (h *ReservationHandler) UpdateStatusByUser(w http.ResponseWriter, r *http.Request) {
+	userID := r.PathValue("userId")
+
+	var reqBody struct {
+		ID            string `json:"id"`
+		RestaurantID  string `json:"restaurantId"`
+		ReservationID string `json:"reservationId"`
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&reqBody); err != nil {
+		util.JsonError(w, http.StatusBadRequest, "Invalid request body")
+		return
+	}
+	defer r.Body.Close()
+
+	if userID == "" || reqBody.ID == "" || reqBody.RestaurantID == "" || reqBody.ReservationID == "" {
+		util.JsonError(w, http.StatusBadRequest, "Missing required fields: userId, id, restaurantId, or reservationId")
+		return
+	}
+
+	// Validate the MongoDB ObjectID format
+	objID, err := bson.ObjectIDFromHex(reqBody.ID)
+	if err != nil {
+		util.JsonError(w, http.StatusBadRequest, "Invalid reservation ID format")
+		return
+	}
+
+	// Construct the exact filter from your Node.js code
+	filter := bson.M{
+		"_id":                           objID,
+		"restaurantId":                  reqBody.RestaurantID,
+		"userId":                        userID,
+		"reservationInfo.reservationID": reqBody.ReservationID,
+	}
+
+	// BUG FIX: Must explicitly use "$set" in Go, unlike Mongoose
+	update := bson.M{
+		"$set": bson.M{
+			"status": "cancelled",
+		},
+	}
+
+	// Tell MongoDB to return the newly updated document (equivalent to { new: true } in Mongoose)
+	opts := options.FindOneAndUpdate().SetReturnDocument(options.After)
+
+	// Decode the updated document into a generic map
+	var updatedReservation bson.M
+	err = h.DB.Collection("reservations").FindOneAndUpdate(r.Context(), filter, update, opts).Decode(&updatedReservation)
+
+	if err != nil {
+		if err == mongo.ErrNoDocuments {
+			util.JsonError(w, http.StatusNotFound, "Reservation not found or details do not match")
+			return
+		}
+		util.JsonError(w, http.StatusInternalServerError, "An error occurred while updating the reservation")
+		return
+	}
+
+	// Return the updated reservation document exactly like Express
+	util.JsonResponse(w, http.StatusOK, updatedReservation)
 }

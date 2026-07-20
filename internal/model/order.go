@@ -28,9 +28,9 @@ type Order struct {
 	UserID         bson.ObjectID  `bson:"userId" json:"userId"`
 	RestaurantName string         `bson:"restaurantName" json:"restaurantName"`
 	RestaurantID   bson.ObjectID  `bson:"restaurantId" json:"restaurantId"`
-	ReservationID  bson.ObjectID  `bson:"reservationId" json:"reservationId"`
+	ReservationID  string         `bson:"reservationId" json:"reservationId"`
 	TableNumber    string         `bson:"tableNumber" json:"tableNumber"`
-	Items          []MenuItem     `bson:"items" json:"items"` // MenuItem is defined in restaurant.go
+	Items          []MenuItem     `bson:"items" json:"items"`
 	TotalAmount    float64        `bson:"totalAmount" json:"totalAmount"`
 	OrderStatus    OrderStatus    `bson:"orderStatus" json:"orderStatus"`
 	PaymentStatus  PaymentStatus  `bson:"paymentStatus" json:"paymentStatus"`
