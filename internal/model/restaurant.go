@@ -17,7 +17,7 @@ const (
 
 type Restaurant struct {
 	ID             bson.ObjectID    `bson:"_id,omitempty" json:"id"`
-	OrganizationID bson.ObjectID    `bson:"organizationId,omitempty" json:"organizationId"` // For multi-branch
+	OrganizationID bson.ObjectID    `bson:"organizationId,omitempty" json:"organizationId"`
 	Title          string           `bson:"title" json:"title"`
 	Data           []RestaurantData `bson:"data" json:"data"`
 
@@ -56,13 +56,13 @@ type Menu struct {
 }
 
 type MenuItem struct {
-	ID          string  `bson:"_id,omitempty" json:"id,omitempty"`
-	Image       string  `bson:"image,omitempty" json:"image,omitempty"`
-	Name        string  `bson:"name" json:"name"`
-	Description string  `bson:"description,omitempty" json:"description,omitempty"`
-	Cost        float64 `bson:"cost" json:"cost"`
-	Rate        float64 `bson:"rate,omitempty" json:"rate,omitempty"`
-	Quantity    int     `bson:"quantity,omitempty" json:"quantity,omitempty"`
+	ID          bson.ObjectID `bson:"_id,omitempty" json:"_id"`
+	Image       string        `bson:"image,omitempty" json:"image,omitempty"`
+	Name        string        `bson:"name" json:"name"`
+	Description string        `bson:"description,omitempty" json:"description,omitempty"`
+	Cost        float64       `bson:"cost" json:"cost"`
+	Rate        float64       `bson:"rate,omitempty" json:"rate,omitempty"`
+	Quantity    int           `bson:"quantity,omitempty" json:"quantity,omitempty"`
 }
 
 type Review struct {

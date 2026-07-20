@@ -12,7 +12,6 @@ import (
 	"swiftab/server/internal/util"
 	"time"
 
-	"go.mongodb.org/mongo-driver/bson/primitive"
 	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
 )
@@ -23,10 +22,10 @@ type AdminHandler struct {
 	Image     *util.CloudinaryService
 }
 
-func (h *AdminHandler) getAdminID(r *http.Request) (primitive.ObjectID, error) {
-	tid, ok := r.Context().Value(middleware.AdminIDKey).(primitive.ObjectID)
+func (h *AdminHandler) getAdminID(r *http.Request) (bson.ObjectID, error) {
+	tid, ok := r.Context().Value(middleware.AdminIDKey).(bson.ObjectID)
 	if !ok {
-		return primitive.NilObjectID, errors.New("missing admin ID")
+		return bson.NilObjectID, errors.New("missing admin ID")
 	}
 	return tid, nil
 }
@@ -134,7 +133,7 @@ func (h *AdminHandler) LoginAdmin(w http.ResponseWriter, r *http.Request) {
 	isProd := false
 
 	cookie := &http.Cookie{
-		Name:     "admin_auth",
+		Name:     "access_token",
 		Value:    tokenString,
 		Path:     "/",
 		MaxAge:   24 * 60 * 60,

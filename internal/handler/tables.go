@@ -3,6 +3,7 @@ package handler
 import (
 	"encoding/json"
 	"errors"
+	"log"
 	"net/http"
 
 	"swiftab/server/internal/middleware"
@@ -36,18 +37,19 @@ func (h *TableHandler) FetchRestaurantInfo(w http.ResponseWriter, r *http.Reques
 	opts := options.FindOne().SetProjection(bson.M{"diningAreas": 1})
 
 	var layout models.RestaurantLayout
-	err = h.DB.Collection("restaurantlayouts").FindOne(r.Context(), bson.M{"restaurantId": restaurantID}, opts).Decode(&layout)
+	err = h.DB.Collection("restaurantlayouts").FindOne(r.Context(), bson.M{"restaurantId": restaurantID.Hex()}, opts).Decode(&layout)
 
 	if err != nil {
 		if err == mongo.ErrNoDocuments {
-			util.JsonError(w, http.StatusNotFound, "Dining areas not found")
+			util.JsonResponse(w, http.StatusOK, map[string]interface{}{
+				"diningAreas": []string{},
+			})
 			return
 		}
 		util.JsonError(w, http.StatusInternalServerError, "Error fetching restaurant layout")
 		return
 	}
 
-	// Ensure we return an empty array [] instead of null if no areas exist
 	if layout.DiningAreas == nil {
 		layout.DiningAreas = []string{}
 	}
@@ -64,18 +66,15 @@ func (h *TableHandler) FetchResTable(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	restID, err := bson.ObjectIDFromHex(restaurantIDStr)
-	if err != nil {
-		util.JsonError(w, http.StatusBadRequest, "Invalid restaurantId format")
-		return
-	}
-
 	var layout models.RestaurantLayout
-	err = h.DB.Collection("restaurantlayouts").FindOne(r.Context(), bson.M{"restaurantId": restID}).Decode(&layout)
+	err := h.DB.Collection("restaurantlayouts").FindOne(r.Context(), bson.M{"restaurantId": restaurantIDStr}).Decode(&layout)
 
 	if err != nil {
 		if err == mongo.ErrNoDocuments {
-			util.JsonError(w, http.StatusNotFound, "Tables not found for this restaurant")
+			util.JsonResponse(w, http.StatusOK, map[string]interface{}{
+				"message":              "No tables found yet",
+				"restaurantLayoutData": map[string]interface{}{"tablePosition": []interface{}{}},
+			})
 			return
 		}
 		util.JsonError(w, http.StatusInternalServerError, "Server error")
@@ -96,13 +95,19 @@ func (h *TableHandler) FetchRestaurantTables(w http.ResponseWriter, r *http.Requ
 	}
 
 	var layout models.RestaurantLayout
-	err = h.DB.Collection("restaurantlayouts").FindOne(r.Context(), bson.M{"restaurantId": restaurantID}).Decode(&layout)
+	// BUG FIX: Query using .Hex() because it's a string in the DB
+	err = h.DB.Collection("restaurantlayouts").FindOne(r.Context(), bson.M{"restaurantId": restaurantID.Hex()}).Decode(&layout)
 
 	if err != nil {
 		if err == mongo.ErrNoDocuments {
-			util.JsonError(w, http.StatusNotFound, "tables not found for this restaurant")
+			// GRACEFUL FALLBACK: Return an empty structure instead of a 404 error
+			util.JsonResponse(w, http.StatusOK, map[string]interface{}{
+				"message":              "no tables found for this restaurant",
+				"restaurantLayoutData": map[string]interface{}{"tablePosition": []interface{}{}},
+			})
 			return
 		}
+		log.Printf("error fetching res tables:%v", err)
 		util.JsonError(w, http.StatusInternalServerError, "Server error")
 		return
 	}
@@ -122,7 +127,7 @@ func (h *TableHandler) SaveLayoutInfo(w http.ResponseWriter, r *http.Request) {
 
 	var reqBody struct {
 		DiningAreas   []string `json:"diningAreas"`
-		TableCapacity int      `json:"tableCapacity"` // Maps incoming JSON
+		TableCapacity int      `json:"tableCapacity"`
 		TotalTables   int      `json:"totalTables"`
 	}
 
@@ -137,11 +142,10 @@ func (h *TableHandler) SaveLayoutInfo(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Build the Upsert query using bson.M
-	filter := bson.M{"restaurantId": restaurantID}
+	filter := bson.M{"restaurantId": restaurantID.Hex()}
 	update := bson.M{
 		"$set": bson.M{
-			"restaurantId":  restaurantID,
+			"restaurantId":  restaurantID.Hex(),
 			"diningAreas":   reqBody.DiningAreas,
 			"totalCapacity": reqBody.TableCapacity,
 			"totalTables":   reqBody.TotalTables,
@@ -192,10 +196,12 @@ func (h *TableHandler) SaveTables(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	filter := bson.M{"restaurantId": restaurantID}
+	// BUG FIX: Filter by the string version of the ID
+	filter := bson.M{"restaurantId": restaurantID.Hex()}
 	update := bson.M{
 		"$set": bson.M{
-			"restaurantId":  restaurantID,
+			// BUG FIX: Save the ID back to the database as a string
+			"restaurantId":  restaurantID.Hex(),
 			"tablePosition": reqBody.Tables,
 		},
 	}

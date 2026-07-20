@@ -16,14 +16,14 @@ import (
 )
 
 func main() {
-	log.Println("Starting ISP Engine ...")
+	log.Println("Starting Swiftab Engine ...")
 
 	cfg := config.LoadConfig()
 	port := cfg.Port
 	mongoDB := cfg.MongoURI
 
 	mongoClient := db.Connect(mongoDB)
-	swiftabDB := mongoClient.Database("swiftab")
+	swiftabDB := mongoClient.Database("test")
 
 	imageService, err := util.NewCloudinaryService(cfg.CldName, cfg.CldApiKey, cfg.CldApiSk)
 	if err != nil {
@@ -56,7 +56,7 @@ func main() {
 
 			w.Header().Set("Access-Control-Allow-Credentials", "true")
 			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
-			w.Header().Set("Access-Control-Allow-Headers", "Content-Type, X-Requested-With, X-Tenant-ID, X-Restaurant-ID")
+			w.Header().Set("Access-Control-Allow-Headers", "Content-Type, X-Requested-With, X-Admin-ID, X-Restaurant-ID")
 
 			if r.Method == http.MethodOptions {
 				w.WriteHeader(http.StatusOK)
@@ -78,13 +78,13 @@ func main() {
 	mux.HandleFunc("POST /api/v2/waiters/password", waiterHandler.WaiterPassword)
 	mux.HandleFunc("POST /api/v2/waiters/login", waiterHandler.LoginWaiter)
 
-	mux.HandleFunc("GET /api/v2/restaurants/{restaurantId}/menu", menuHandler.GetMenu)
-	mux.HandleFunc("GET /api/v2/restaurants/{restaurantId}/tables", tableHandler.FetchResTable)
+	mux.Handle("GET /api/v2/restaurants/menu", middleware.AuthMiddleware(http.HandlerFunc(menuHandler.GetMenu)))
+	mux.Handle("GET /api/v2/restaurants/tables", middleware.AuthMiddleware(http.HandlerFunc(tableHandler.FetchResTable)))
 	mux.HandleFunc("POST /api/v2/reservations/availability", reserveHandler.CheckAvailability)
 
 	mux.Handle("GET /api/v2/admin/info", middleware.AuthMiddleware(http.HandlerFunc(adminHandler.GetAdminInfo)))
 	mux.Handle("POST /api/v2/admin/restaurant", middleware.AuthMiddleware(http.HandlerFunc(adminHandler.AddRestaurantData)))
-	mux.Handle("POST /api/v2/admin/waiters", middleware.AuthMiddleware(http.HandlerFunc(adminHandler.WaiterSignUp)))
+	mux.Handle("POST /api/v2/admin/waiters/signup", middleware.AuthMiddleware(http.HandlerFunc(adminHandler.WaiterSignUp)))
 	mux.Handle("GET /api/v2/admin/waiters", middleware.AuthMiddleware(http.HandlerFunc(adminHandler.FetchWaiter)))
 	mux.Handle("DELETE /api/v2/admin/waiters/{id}", middleware.AuthMiddleware(http.HandlerFunc(adminHandler.DeleteWaiter)))
 
@@ -92,18 +92,22 @@ func main() {
 	mux.Handle("POST /api/v2/admin/menu/{menuType}", middleware.AuthMiddleware(http.HandlerFunc(menuHandler.AddMenu)))
 	mux.Handle("PUT /api/v2/admin/menu/{menuType}/{itemId}", middleware.AuthMiddleware(http.HandlerFunc(menuHandler.UpdateMenuItem)))
 	mux.Handle("DELETE /api/v2/admin/menu/{menuType}/{itemId}", middleware.AuthMiddleware(http.HandlerFunc(menuHandler.DeleteMenuItem)))
+
 	mux.Handle("GET /api/v2/admin/layout/info", middleware.AuthMiddleware(http.HandlerFunc(tableHandler.FetchRestaurantInfo)))
 	mux.Handle("POST /api/v2/admin/layout/info", middleware.AuthMiddleware(http.HandlerFunc(tableHandler.SaveLayoutInfo)))
 	mux.Handle("GET /api/v2/admin/layout/tables", middleware.AuthMiddleware(http.HandlerFunc(tableHandler.FetchRestaurantTables)))
 	mux.Handle("POST /api/v2/admin/layout/tables", middleware.AuthMiddleware(http.HandlerFunc(tableHandler.SaveTables)))
+
 	mux.Handle("GET /api/v2/admin/orders", middleware.AuthMiddleware(http.HandlerFunc(orderHandler.FetchAllOrder)))
 	mux.Handle("GET /api/v2/admin/reservations", middleware.AuthMiddleware(http.HandlerFunc(reserveHandler.FetchReservations)))
+
 	mux.Handle("POST /api/v2/users/{userId}/restaurants/{restaurantId}/reservations", middleware.AuthMiddleware(http.HandlerFunc(reserveHandler.CreateReservation)))
 	mux.Handle("GET /api/v2/users/{userId}/reservations/active", middleware.AuthMiddleware(http.HandlerFunc(reserveHandler.UserActiveReservation)))
 	mux.Handle("GET /api/v2/users/{userId}/reservations/completed", middleware.AuthMiddleware(http.HandlerFunc(reserveHandler.UserCompletedReservation)))
 	mux.Handle("POST /api/v2/users/orders", middleware.AuthMiddleware(http.HandlerFunc(orderHandler.CreateOrder)))
 	mux.Handle("GET /api/v2/users/{userId}/orders", middleware.AuthMiddleware(http.HandlerFunc(orderHandler.GetUserOrders)))
 	mux.Handle("PUT /api/v2/users/orders/{orderId}/complete", middleware.AuthMiddleware(http.HandlerFunc(orderHandler.UserCompleteOrder)))
+
 	mux.Handle("GET /api/v2/waiters/restaurants/{restaurantId}/orders", middleware.AuthMiddleware(http.HandlerFunc(orderHandler.GetWaiterOrders)))
 	mux.Handle("PUT /api/v2/waiters/orders/{orderId}/status", middleware.AuthMiddleware(http.HandlerFunc(orderHandler.UpdateOrderStatus)))
 	mux.Handle("PUT /api/v2/waiters/orders/{orderId}/complete", middleware.AuthMiddleware(http.HandlerFunc(orderHandler.WaiterCompleteOrder)))

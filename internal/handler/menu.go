@@ -81,7 +81,7 @@ func (h *MenuHandler) AddMenu(w http.ResponseWriter, r *http.Request) {
 	}
 
 	newItem := models.MenuItem{
-		ID:          bson.NewObjectID().Hex(),
+		ID:          bson.NewObjectID(),
 		Name:        name,
 		Description: description,
 		Cost:        cost,
@@ -112,6 +112,11 @@ func (h *MenuHandler) UpdateMenuItem(w http.ResponseWriter, r *http.Request) {
 
 	menuType := r.PathValue("menuType")
 	itemIDStr := r.PathValue("itemId")
+	itemID, err := bson.ObjectIDFromHex(itemIDStr)
+	if err != nil {
+		util.JsonError(w, http.StatusBadRequest, "Invalid Item ID format")
+		return
+	}
 
 	if menuType != "breakfast" && menuType != "lunch" && menuType != "dinner" {
 		util.JsonError(w, http.StatusBadRequest, "Invalid menu type")
@@ -149,7 +154,7 @@ func (h *MenuHandler) UpdateMenuItem(w http.ResponseWriter, r *http.Request) {
 
 	filter := bson.M{
 		"_id":                             restaurantID,
-		fmt.Sprintf("%s._id", updatePath): itemIDStr,
+		fmt.Sprintf("%s._id", updatePath): itemID,
 	}
 	update := bson.M{"$set": setFields}
 
@@ -179,11 +184,17 @@ func (h *MenuHandler) DeleteMenuItem(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	itemID, err := bson.ObjectIDFromHex(itemIDStr)
+	if err != nil {
+		util.JsonError(w, http.StatusBadRequest, "Invalid Item ID format")
+		return
+	}
+
 	updatePath := fmt.Sprintf("data.0.menu.%s", menuType)
 
 	update := bson.M{
 		"$pull": bson.M{
-			updatePath: bson.M{"_id": itemIDStr},
+			updatePath: bson.M{"_id": itemID},
 		},
 	}
 
@@ -198,38 +209,33 @@ func (h *MenuHandler) DeleteMenuItem(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if res.ModifiedCount == 0 {
+		util.JsonError(w, http.StatusNotFound, "Menu item not found in this category")
+		return
+	}
+
 	util.JsonResponse(w, http.StatusOK, map[string]string{
 		"message": "Menu item deleted successfully",
 	})
 }
 
 func (h *MenuHandler) GetMenu(w http.ResponseWriter, r *http.Request) {
-	var targetRestID bson.ObjectID
-	authID, err := h.getRestaurantID(r)
-	if err == nil {
-		targetRestID = authID
-	} else {
-		paramID := r.PathValue("restaurantId")
-		if paramID == "" {
-			util.JsonError(w, http.StatusBadRequest, "No restaurantId provided")
-			return
-		}
-		targetRestID, err = bson.ObjectIDFromHex(paramID)
-		if err != nil {
-			util.JsonError(w, http.StatusBadRequest, "Invalid Restaurant ID format")
-			return
-		}
+	restaurantID, err := h.getRestaurantID(r)
+	if err != nil {
+		util.JsonError(w, http.StatusUnauthorized, "Restaurant not authenticated")
+		return
 	}
 	opts := options.FindOne().SetProjection(bson.M{"data.menu": 1})
 
 	var restaurant models.Restaurant
-	err = h.DB.Collection("restaurants").FindOne(r.Context(), bson.M{"_id": targetRestID}, opts).Decode(&restaurant)
+	err = h.DB.Collection("restaurants").FindOne(r.Context(), bson.M{"_id": restaurantID}, opts).Decode(&restaurant)
 
 	if err != nil {
 		if err == mongo.ErrNoDocuments {
 			util.JsonError(w, http.StatusNotFound, "Restaurant not found")
 			return
 		}
+
 		util.JsonError(w, http.StatusInternalServerError, "Error retrieving menu")
 		return
 	}
