@@ -137,6 +137,8 @@ func (h *OrderHandler) CreateOrder(w http.ResponseWriter, r *http.Request) {
 		TotalAmount:    newItemsTotal,
 		OrderStatus:    "placed",
 		PaymentStatus:  "unpaid",
+		CreatedAt:      time.Now().UTC(),
+		UpdatedAt:      time.Now().UTC(),
 	}
 
 	_, err = h.DB.Collection("orders").InsertOne(r.Context(), newOrder)
