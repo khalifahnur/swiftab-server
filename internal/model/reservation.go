@@ -13,7 +13,17 @@ const (
 	ReservationCancelled ReservationStatus = "cancelled"
 	ReservationCompleted ReservationStatus = "completed"
 	ReservationSeated    ReservationStatus = "seated"
+	ReservationNoShow    ReservationStatus = "no_show"
 )
+
+// ValidReservationStatus reports whether s is a status a reservation can hold.
+func ValidReservationStatus(s string) bool {
+	switch ReservationStatus(s) {
+	case ReservationActive, ReservationCancelled, ReservationCompleted, ReservationSeated, ReservationNoShow:
+		return true
+	}
+	return false
+}
 
 type ReservationInfo struct {
 	ReservationID  string    `bson:"reservationID" json:"reservationID"`
@@ -27,6 +37,7 @@ type ReservationInfo struct {
 	TableNumber    string    `bson:"tableNumber" json:"tableNumber"`
 	DiningArea     string    `bson:"diningArea" json:"diningArea"`
 	RestaurantName string    `bson:"restaurantName" json:"restaurantName"`
+	Notes          string    `bson:"notes,omitempty" json:"notes,omitempty"`
 }
 
 type Reservation struct {

@@ -1,41 +1,65 @@
 package handler
 
 import (
-	"crypto/rand"
-	"encoding/json"
 	"errors"
-	"fmt"
-	"math/big"
+	"log"
 	"net/http"
+	"strings"
+	"time"
+
 	"swiftab/server/internal/middleware"
 	models "swiftab/server/internal/model"
 	"swiftab/server/internal/util"
-	"time"
 
 	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
 )
 
 type AdminHandler struct {
-	DB        *mongo.Database
-	SecretKey string
-	Image     *util.CloudinaryService
+	*Base
 }
 
-func (h *AdminHandler) getAdminID(r *http.Request) (bson.ObjectID, error) {
-	tid, ok := r.Context().Value(middleware.AdminIDKey).(bson.ObjectID)
-	if !ok {
-		return bson.NilObjectID, errors.New("missing admin ID")
+const (
+	adminSessionTTL = 7 * 24 * time.Hour
+	waiterInviteTTL = 48 * time.Hour
+	minPasswordLen  = 6
+)
+
+// sessionCookie builds the admin session cookie. Clearing a cookie only works
+// when name, domain and path match the cookie that was set, so sign-in and
+// sign-out both go through here.
+func (h *AdminHandler) sessionCookie(value string, maxAge int) *http.Cookie {
+	cookie := &http.Cookie{
+		Name:     middleware.AccessCookie,
+		Value:    value,
+		Path:     "/",
+		MaxAge:   maxAge,
+		HttpOnly: true,
 	}
-	return tid, nil
+	if h.Cfg != nil && h.Cfg.IsProd() {
+		cookie.Domain = h.Cfg.CookieDomain
+		cookie.Secure = true
+		cookie.SameSite = http.SameSiteNoneMode
+	} else {
+		cookie.SameSite = http.SameSiteLaxMode
+	}
+	if maxAge < 0 {
+		cookie.Expires = time.Unix(0, 0)
+	}
+	return cookie
 }
 
-func (h *AdminHandler) getRestaurantID(r *http.Request) (bson.ObjectID, error) {
-	rid, ok := r.Context().Value(middleware.RestaurantIDKey).(bson.ObjectID)
-	if !ok {
-		return bson.NilObjectID, errors.New("missing restaurant ID")
+func (h *AdminHandler) startSession(w http.ResponseWriter, admin *models.Admin) error {
+	restaurantID := ""
+	if admin.RestaurantID != nil {
+		restaurantID = admin.RestaurantID.Hex()
 	}
-	return rid, nil
+	token, err := util.GenerateToken(admin.ID.Hex(), restaurantID, admin.Email, util.RoleAdmin, adminSessionTTL)
+	if err != nil {
+		return err
+	}
+	http.SetCookie(w, h.sessionCookie(token, int(adminSessionTTL.Seconds())))
+	return nil
 }
 
 func (h *AdminHandler) SignUpAdmin(w http.ResponseWriter, r *http.Request) {
@@ -46,22 +70,35 @@ func (h *AdminHandler) SignUpAdmin(w http.ResponseWriter, r *http.Request) {
 		PhoneNumber string `json:"phoneNumber"`
 	}
 
-	if err := json.NewDecoder(r.Body).Decode(&reqBody); err != nil {
+	if err := util.DecodeJSON(w, r, &reqBody); err != nil {
 		util.JsonError(w, http.StatusBadRequest, "Invalid request body")
 		return
 	}
 
-	defer r.Body.Close()
+	reqBody.Name = strings.TrimSpace(reqBody.Name)
+	reqBody.PhoneNumber = strings.TrimSpace(reqBody.PhoneNumber)
+	email, emailOK := util.NormalizeEmail(reqBody.Email)
 
 	if reqBody.Name == "" || reqBody.Email == "" || reqBody.Password == "" || reqBody.PhoneNumber == "" {
 		util.JsonError(w, http.StatusBadRequest, "All fields are required")
 		return
 	}
+	if !emailOK {
+		util.JsonError(w, http.StatusBadRequest, "Enter a valid email address")
+		return
+	}
+	if len(reqBody.Password) < minPasswordLen {
+		util.JsonError(w, http.StatusBadRequest, "Password must be at least 6 characters")
+		return
+	}
 
-	var existingAdmin models.Admin
-	err := h.DB.Collection("admins").FindOne(r.Context(), bson.M{"email": reqBody.Email}).Decode(&existingAdmin)
-	if err != mongo.ErrNoDocuments {
-		util.JsonError(w, http.StatusUnauthorized, "User already exists")
+	err := h.DB.Collection("admins").FindOne(r.Context(), bson.M{"email": email}).Err()
+	if err == nil {
+		util.JsonError(w, http.StatusConflict, "An account with this email already exists")
+		return
+	}
+	if !errors.Is(err, mongo.ErrNoDocuments) {
+		util.JsonError(w, http.StatusInternalServerError, "Database error")
 		return
 	}
 
@@ -71,18 +108,18 @@ func (h *AdminHandler) SignUpAdmin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	now := time.Now().UTC()
 	newAdmin := models.Admin{
 		ID:          bson.NewObjectID(),
 		Name:        reqBody.Name,
-		Email:       reqBody.Email,
+		Email:       email,
 		Password:    hashedPassword,
 		PhoneNumber: reqBody.PhoneNumber,
-		CreatedAt:   time.Now(),
-		UpdatedAt:   time.Now(),
+		CreatedAt:   now,
+		UpdatedAt:   now,
 	}
 
-	_, err = h.DB.Collection("admins").InsertOne(r.Context(), newAdmin)
-	if err != nil {
+	if _, err = h.DB.Collection("admins").InsertOne(r.Context(), newAdmin); err != nil {
 		util.JsonError(w, http.StatusInternalServerError, "Error creating user")
 		return
 	}
@@ -96,17 +133,21 @@ func (h *AdminHandler) LoginAdmin(w http.ResponseWriter, r *http.Request) {
 		Password string `json:"password"`
 	}
 
-	if err := json.NewDecoder(r.Body).Decode(&reqBody); err != nil {
+	if err := util.DecodeJSON(w, r, &reqBody); err != nil {
 		util.JsonError(w, http.StatusBadRequest, "Invalid request body")
 		return
 	}
 
-	defer r.Body.Close()
+	email, _ := util.NormalizeEmail(reqBody.Email)
 
 	var admin models.Admin
-	err := h.DB.Collection("admins").FindOne(r.Context(), bson.M{"email": reqBody.Email}).Decode(&admin)
+	// Accounts created before emails were normalised may be stored with other
+	// casing, so fall back to the address exactly as typed.
+	err := h.DB.Collection("admins").FindOne(r.Context(), bson.M{
+		"email": bson.M{"$in": bson.A{email, strings.TrimSpace(reqBody.Email)}},
+	}).Decode(&admin)
 	if err != nil {
-		if err == mongo.ErrNoDocuments {
+		if errors.Is(err, mongo.ErrNoDocuments) {
 			util.JsonError(w, http.StatusUnauthorized, "Incorrect Email/Password")
 			return
 		}
@@ -119,138 +160,229 @@ func (h *AdminHandler) LoginAdmin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var restID string
-	if admin.RestaurantID != nil {
-		restID = admin.RestaurantID.Hex()
-	}
-
-	tokenString, err := util.GenerateToken(admin.ID.Hex(), restID, admin.Email, "admin", 24*time.Hour)
-	if err != nil {
+	if err := h.startSession(w, &admin); err != nil {
 		util.JsonError(w, http.StatusInternalServerError, "Failed to generate token")
 		return
 	}
 
-	isProd := true
-
-	cookie := &http.Cookie{
-		Name:     "access_token",
-		Value:    tokenString,
-		Path:     "/",
-		MaxAge:   24 * 60 * 60,
-		Domain:   ".swiftab.co.ke",
-		HttpOnly: true,
-		Secure:   isProd,
-		SameSite: http.SameSiteNoneMode,
-	}
-
-	if isProd {
-		cookie.SameSite = http.SameSiteNoneMode
-	}
-
-	http.SetCookie(w, cookie)
-
-	util.JsonResponse(w, http.StatusOK, map[string]string{
+	util.JsonResponse(w, http.StatusOK, map[string]interface{}{
 		"message": "Login successful",
+		"user": map[string]interface{}{
+			"name":         admin.Name,
+			"email":        admin.Email,
+			"phoneNumber":  admin.PhoneNumber,
+			"restaurantId": admin.RestaurantID,
+		},
 	})
 }
 
+// LogoutAdmin clears the session cookie. It succeeds even when no session
+// exists so a stale browser tab can always sign out.
 func (h *AdminHandler) LogoutAdmin(w http.ResponseWriter, r *http.Request) {
-	// The cookie name MUST match the name used in your AuthMiddleware and Login handler.
-	// Based on your middleware code, it should be "access_token", not "admin_auth".
-	cookieName := "access_token"
-
-	_, err := r.Cookie(cookieName)
-	if err != nil {
-		util.JsonError(w, http.StatusUnauthorized, "No token provided")
-		return
-	}
-
-	// Ideally, pull this from an environment variable: os.Getenv("ENV") == "production"
-	isProd := false
-
-	clearCookie := &http.Cookie{
-		Name:     cookieName,
-		Value:    "",
-		Path:     "/",
-		MaxAge:   -1,
-		Expires:  time.Now().Add(-1 * time.Hour),
-		HttpOnly: true,
-		Secure:   isProd,
-		SameSite: http.SameSiteLaxMode,
-	}
-
-	if isProd {
-		clearCookie.SameSite = http.SameSiteNoneMode
-	}
-
-	http.SetCookie(w, clearCookie)
-
+	http.SetCookie(w, h.sessionCookie("", -1))
 	util.JsonResponse(w, http.StatusOK, map[string]string{
 		"message": "Logged out successfully",
 	})
 }
 
+func (h *AdminHandler) loadAdmin(r *http.Request) (*models.Admin, error) {
+	adminID, err := h.adminID(r)
+	if err != nil {
+		return nil, err
+	}
+	var admin models.Admin
+	if err := h.DB.Collection("admins").FindOne(r.Context(), bson.M{"_id": adminID}).Decode(&admin); err != nil {
+		return nil, err
+	}
+	return &admin, nil
+}
+
 func (h *AdminHandler) GetAdminInfo(w http.ResponseWriter, r *http.Request) {
-	adminID, exists := h.getAdminID(r)
-	if exists != nil {
+	admin, err := h.loadAdmin(r)
+	if err != nil {
 		util.JsonError(w, http.StatusUnauthorized, "Admin not authenticated")
 		return
 	}
 
-	var admin models.Admin
-	err := h.DB.Collection("admins").FindOne(r.Context(), bson.M{"_id": adminID}).Decode(&admin)
-	if err != nil {
-		util.JsonError(w, http.StatusNotFound, "Admin info not found")
-		return
-	}
-
-	var restaurant models.Restaurant
-	if admin.RestaurantID != nil {
-		_ = h.DB.Collection("restaurants").FindOne(r.Context(), bson.M{"_id": *admin.RestaurantID}).Decode(&restaurant)
-	}
-
-	var restData models.RestaurantData
-	var about models.About
-	if len(restaurant.Data) > 0 {
-		restData = restaurant.Data[0]
-		if len(restData.About) > 0 {
-			about = restData.About[0]
-		}
-	}
-
 	responseData := map[string]interface{}{
-		"name":           admin.Name,
-		"createdAt":      admin.CreatedAt,
-		"email":          admin.Email,
-		"phoneNumber":    admin.PhoneNumber,
-		"restaurantName": restData.RestaurantName,
-		"restaurantId":   restaurant.ID,
-		"location":       restData.Location,
-		"image":          restData.Image,
-		"hrsOfOperation": about.HrsOfOperation,
-		"description":    about.Description,
+		"name":         admin.Name,
+		"createdAt":    admin.CreatedAt,
+		"email":        admin.Email,
+		"phoneNumber":  admin.PhoneNumber,
+		"restaurantId": nil,
+	}
+
+	if admin.RestaurantID != nil {
+		restaurant, err := h.loadRestaurant(r.Context(), *admin.RestaurantID)
+		if err == nil && len(restaurant.Data) > 0 {
+			data := restaurant.Data[0]
+			var about models.About
+			if len(data.About) > 0 {
+				about = data.About[0]
+			}
+
+			responseData["restaurantId"] = restaurant.ID
+			responseData["restaurantName"] = data.RestaurantName
+			responseData["location"] = data.Location
+			responseData["latitude"] = data.Latitude
+			responseData["longitude"] = data.Longitude
+			responseData["image"] = data.Image
+			responseData["logo"] = data.Logo
+			responseData["rate"] = data.Rate
+			responseData["reviewCount"] = len(data.Review)
+			responseData["hrsOfOperation"] = about.HrsOfOperation
+			responseData["description"] = about.Description
+			responseData["averagePrice"] = about.AveragePrice
+			responseData["phone"] = about.Phone
+			responseData["restaurantEmail"] = about.Email
+			responseData["cuisines"] = nonNilStrings(data.Cuisines)
+			responseData["amenities"] = nonNilStrings(data.Amenities)
+			responseData["paymentMethods"] = nonNilStrings(data.PaymentMethods)
+			responseData["taxRate"] = data.TaxRate
+			responseData["serviceCharge"] = data.ServiceCharge
+			responseData["openingHours"] = normalizeOpeningHours(data.OpeningHours)
+			responseData["acceptingReservations"] = data.IsAcceptingReservations()
+			responseData["subscriptionStatus"] = restaurant.SubscriptionStatus
+			responseData["subscriptionPlan"] = restaurant.SubscriptionPlan
+			responseData["trialEndsAt"] = restaurant.TrialEndsAt
+		}
 	}
 
 	util.JsonResponse(w, http.StatusOK, responseData)
 }
 
-func generateValidationCode() string {
-	n, _ := rand.Int(rand.Reader, big.NewInt(900000))
-	return fmt.Sprintf("%d", n.Int64()+100000)
+func (h *AdminHandler) UpdateProfile(w http.ResponseWriter, r *http.Request) {
+	adminID, err := h.adminID(r)
+	if err != nil {
+		util.JsonError(w, http.StatusUnauthorized, "Admin not authenticated")
+		return
+	}
+
+	var reqBody struct {
+		Name        string `json:"name"`
+		PhoneNumber string `json:"phoneNumber"`
+	}
+	if err := util.DecodeJSON(w, r, &reqBody); err != nil {
+		util.JsonError(w, http.StatusBadRequest, "Invalid request body")
+		return
+	}
+
+	name := strings.TrimSpace(reqBody.Name)
+	phone := strings.TrimSpace(reqBody.PhoneNumber)
+	if name == "" || phone == "" {
+		util.JsonError(w, http.StatusBadRequest, "Name and phone number are required")
+		return
+	}
+
+	res, err := h.DB.Collection("admins").UpdateByID(r.Context(), adminID, bson.M{"$set": bson.M{
+		"name":        name,
+		"phoneNumber": phone,
+		"updatedAt":   time.Now().UTC(),
+	}})
+	if err != nil || res.MatchedCount == 0 {
+		util.JsonError(w, http.StatusInternalServerError, "Could not update profile")
+		return
+	}
+
+	util.JsonResponse(w, http.StatusOK, map[string]string{"message": "Profile updated"})
 }
 
-func sendWaiterValidationCode(email string, code string) {
-	fmt.Printf("Sending code %s to %s\n", code, email)
+func (h *AdminHandler) ChangePassword(w http.ResponseWriter, r *http.Request) {
+	admin, err := h.loadAdmin(r)
+	if err != nil {
+		util.JsonError(w, http.StatusUnauthorized, "Admin not authenticated")
+		return
+	}
+
+	var reqBody struct {
+		CurrentPassword string `json:"currentPassword"`
+		NewPassword     string `json:"newPassword"`
+	}
+	if err := util.DecodeJSON(w, r, &reqBody); err != nil {
+		util.JsonError(w, http.StatusBadRequest, "Invalid request body")
+		return
+	}
+
+	if !util.VerifyPassword(admin.Password, reqBody.CurrentPassword) {
+		util.JsonError(w, http.StatusBadRequest, "Current password is incorrect")
+		return
+	}
+	if len(reqBody.NewPassword) < minPasswordLen {
+		util.JsonError(w, http.StatusBadRequest, "New password must be at least 6 characters")
+		return
+	}
+
+	hashed, err := util.HashPassword(reqBody.NewPassword)
+	if err != nil {
+		util.JsonError(w, http.StatusInternalServerError, "Error hashing password")
+		return
+	}
+
+	if _, err := h.DB.Collection("admins").UpdateByID(r.Context(), admin.ID, bson.M{"$set": bson.M{
+		"password":  hashed,
+		"updatedAt": time.Now().UTC(),
+	}}); err != nil {
+		util.JsonError(w, http.StatusInternalServerError, "Could not update password")
+		return
+	}
+
+	util.JsonResponse(w, http.StatusOK, map[string]string{"message": "Password updated"})
 }
 
-func sendWaiterSigninEmail(email string) {
-	fmt.Printf("Sending signin email to %s\n", email)
+// --- Waiters ---------------------------------------------------------------
+
+// waiterView is what the dashboard sees for a member of the floor team. The
+// invite code is included only until the waiter has claimed the account, so
+// the manager can pass it on in person when email is not set up.
+func waiterView(w models.Waiter) map[string]interface{} {
+	view := map[string]interface{}{
+		"id":          w.ID.Hex(),
+		"firstname":   w.FirstName,
+		"lastname":    w.LastName,
+		"email":       w.Email,
+		"phoneNumber": w.PhoneNumber,
+		"createdAt":   w.CreatedAt,
+		"onDuty":      w.OnDuty,
+		"status":      "active",
+	}
+	if w.RestaurantID != nil {
+		view["restaurantId"] = w.RestaurantID.Hex()
+	}
+	if !w.IsActivated() {
+		view["status"] = "pending"
+		view["inviteCode"] = w.ValidationCode
+		view["inviteExpiresAt"] = w.ValidationCodeExpiration
+		view["inviteExpired"] = w.ValidationCodeExpiration != nil && time.Now().After(*w.ValidationCodeExpiration)
+	}
+	return view
+}
+
+// sendWaiterInvite emails the invite code when email is configured and
+// reports whether an email was attempted.
+func (h *AdminHandler) sendWaiterInvite(r *http.Request, waiter models.Waiter, restaurantID bson.ObjectID) bool {
+	if !h.Mailer.Enabled() {
+		return false
+	}
+	restaurantName := ""
+	if restaurant, err := h.loadRestaurant(r.Context(), restaurantID); err == nil && len(restaurant.Data) > 0 {
+		restaurantName = restaurant.Data[0].RestaurantName
+	}
+	subject, body := util.WaiterInviteEmail(waiter.FirstName, restaurantName, waiter.ValidationCode)
+	h.Mailer.SendAsync(waiter.Email, subject, body)
+	return true
+}
+
+func inviteMessage(emailed bool) string {
+	if emailed {
+		return "Waiter added. Their invite code has been emailed and is shown below."
+	}
+	return "Waiter added. Share the invite code below with them to finish sign-up in the app."
 }
 
 func (h *AdminHandler) WaiterSignUp(w http.ResponseWriter, r *http.Request) {
-	restaurantID, err := h.getRestaurantID(r)
+	restaurantID, err := h.restaurantID(r)
 	if err != nil {
-		util.JsonError(w, http.StatusUnauthorized, "Restaurant not authenticated")
+		util.JsonError(w, http.StatusBadRequest, "Set up your restaurant before adding staff")
 		return
 	}
 
@@ -261,79 +393,154 @@ func (h *AdminHandler) WaiterSignUp(w http.ResponseWriter, r *http.Request) {
 		PhoneNumber string `json:"phoneNumber"`
 	}
 
-	if err := json.NewDecoder(r.Body).Decode(&reqBody); err != nil {
+	if err := util.DecodeJSON(w, r, &reqBody); err != nil {
 		util.JsonError(w, http.StatusBadRequest, "Invalid request body")
 		return
 	}
-	defer r.Body.Close()
 
-	if reqBody.FirstName == "" || reqBody.LastName == "" || reqBody.Email == "" || reqBody.PhoneNumber == "" {
+	firstName := strings.TrimSpace(reqBody.FirstName)
+	lastName := strings.TrimSpace(reqBody.LastName)
+	phone := strings.TrimSpace(reqBody.PhoneNumber)
+	email, emailOK := util.NormalizeEmail(reqBody.Email)
+
+	if firstName == "" || lastName == "" || reqBody.Email == "" || phone == "" {
 		util.JsonError(w, http.StatusBadRequest, "All fields are required")
 		return
 	}
-
-	// Check if Waiter already exists
-	var existingWaiter models.Waiter
-	err = h.DB.Collection("waiters").FindOne(r.Context(), bson.M{"email": reqBody.Email}).Decode(&existingWaiter)
-	if err != mongo.ErrNoDocuments {
-		util.JsonError(w, http.StatusUnauthorized, "Waiter already exists")
+	if !emailOK {
+		util.JsonError(w, http.StatusBadRequest, "Enter a valid email address")
 		return
 	}
 
-	validationCode := generateValidationCode()
-	expiration := time.Now().Add(10 * time.Minute)
+	err = h.DB.Collection("waiters").FindOne(r.Context(), bson.M{"email": email}).Err()
+	if err == nil {
+		util.JsonError(w, http.StatusConflict, "A waiter with this email already exists")
+		return
+	}
+	if !errors.Is(err, mongo.ErrNoDocuments) {
+		util.JsonError(w, http.StatusInternalServerError, "Database error")
+		return
+	}
+
+	now := time.Now().UTC()
+	expiration := now.Add(waiterInviteTTL)
 
 	newWaiter := models.Waiter{
 		ID:                       bson.NewObjectID(),
-		FirstName:                reqBody.FirstName,
-		LastName:                 reqBody.LastName,
-		Email:                    reqBody.Email,
-		PhoneNumber:              reqBody.PhoneNumber,
+		FirstName:                firstName,
+		LastName:                 lastName,
+		Email:                    email,
+		PhoneNumber:              phone,
 		RestaurantID:             &restaurantID,
-		ValidationCode:           validationCode,
+		ValidationCode:           util.GenerateCode(),
 		ValidationCodeExpiration: &expiration,
-		CreatedAt:                time.Now(),
-		UpdatedAt:                time.Now(),
+		CreatedAt:                now,
+		UpdatedAt:                now,
 	}
 
-	_, err = h.DB.Collection("waiters").InsertOne(r.Context(), newWaiter)
-	if err != nil {
+	if _, err = h.DB.Collection("waiters").InsertOne(r.Context(), newWaiter); err != nil {
 		util.JsonError(w, http.StatusInternalServerError, "Error creating waiter")
 		return
 	}
 
-	// Send email asynchronously
-	go sendWaiterValidationCode(reqBody.Email, validationCode)
+	emailed := h.sendWaiterInvite(r, newWaiter, restaurantID)
 
-	util.JsonResponse(w, http.StatusOK, map[string]string{
-		"message": "Waiter created successfully",
+	util.JsonResponse(w, http.StatusOK, map[string]interface{}{
+		"message": inviteMessage(emailed),
+		"emailed": emailed,
+		"waiter":  waiterView(newWaiter),
 	})
 }
 
-func (h *AdminHandler) DeleteWaiter(w http.ResponseWriter, r *http.Request) {
-	adminID, exists := h.getAdminID(r)
-	if exists != nil {
-		util.JsonError(w, http.StatusUnauthorized, "Admin not authenticated")
+// ResendWaiterInvite issues a fresh invite code for a waiter who has not
+// finished signing up. With ?reset=true it also works for an active waiter:
+// their password is cleared so they can set a new one with the new code,
+// which is how a manager helps someone who forgot their password.
+func (h *AdminHandler) ResendWaiterInvite(w http.ResponseWriter, r *http.Request) {
+	restaurantID, err := h.restaurantID(r)
+	if err != nil {
+		util.JsonError(w, http.StatusBadRequest, "Restaurant ID is required")
 		return
 	}
 
-	waiterIDStr := r.PathValue("id")
-	waiterID, err := bson.ObjectIDFromHex(waiterIDStr)
+	waiterID, err := bson.ObjectIDFromHex(r.PathValue("id"))
 	if err != nil {
 		util.JsonError(w, http.StatusBadRequest, "Invalid Waiter ID")
 		return
 	}
 
-	var admin models.Admin
-	err = h.DB.Collection("admins").FindOne(r.Context(), bson.M{"_id": adminID}).Decode(&admin)
-	if err != nil {
-		util.JsonError(w, http.StatusNotFound, "Admin info not found")
+	var waiter models.Waiter
+	filter := bson.M{"_id": waiterID, "restaurantId": restaurantID}
+	if err := h.DB.Collection("waiters").FindOne(r.Context(), filter).Decode(&waiter); err != nil {
+		util.JsonError(w, http.StatusNotFound, "Waiter not found")
 		return
 	}
 
-	_, err = h.DB.Collection("waiters").DeleteOne(r.Context(), bson.M{"_id": waiterID})
+	reset := r.URL.Query().Get("reset") == "true"
+	if waiter.IsActivated() && !reset {
+		util.JsonError(w, http.StatusConflict, "This waiter has already finished signing up")
+		return
+	}
+
+	expiration := time.Now().UTC().Add(waiterInviteTTL)
+	waiter.ValidationCode = util.GenerateCode()
+	waiter.ValidationCodeExpiration = &expiration
+
+	unset := bson.M{"validatedAt": ""}
+	if waiter.IsActivated() {
+		// Signing in again requires the new code; drop their devices too.
+		unset["password"] = ""
+		unset["pushTokens"] = ""
+		waiter.Password = ""
+	}
+
+	if _, err := h.DB.Collection("waiters").UpdateOne(r.Context(), filter, bson.M{
+		"$set": bson.M{
+			"validationcode":           waiter.ValidationCode,
+			"validationcodeExpiration": expiration,
+			"updatedAt":                time.Now().UTC(),
+		},
+		"$unset": unset,
+	}); err != nil {
+		util.JsonError(w, http.StatusInternalServerError, "Could not refresh the invite")
+		return
+	}
+
+	emailed := h.sendWaiterInvite(r, waiter, restaurantID)
+	message := "New invite code created. Share it with the waiter."
+	if emailed {
+		message = "New invite code created and emailed."
+	}
+
+	util.JsonResponse(w, http.StatusOK, map[string]interface{}{
+		"message": message,
+		"emailed": emailed,
+		"waiter":  waiterView(waiter),
+	})
+}
+
+func (h *AdminHandler) DeleteWaiter(w http.ResponseWriter, r *http.Request) {
+	restaurantID, err := h.restaurantID(r)
+	if err != nil {
+		util.JsonError(w, http.StatusBadRequest, "Restaurant ID is required")
+		return
+	}
+
+	waiterID, err := bson.ObjectIDFromHex(r.PathValue("id"))
+	if err != nil {
+		util.JsonError(w, http.StatusBadRequest, "Invalid Waiter ID")
+		return
+	}
+
+	// Scoped to the admin's own restaurant so one restaurant cannot remove
+	// another's staff by guessing ids.
+	res, err := h.DB.Collection("waiters").DeleteOne(r.Context(), bson.M{"_id": waiterID, "restaurantId": restaurantID})
 	if err != nil {
 		util.JsonError(w, http.StatusInternalServerError, "Server error")
+		return
+	}
+	if res.DeletedCount == 0 {
+		util.JsonError(w, http.StatusNotFound, "Waiter not found")
 		return
 	}
 
@@ -341,124 +548,43 @@ func (h *AdminHandler) DeleteWaiter(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *AdminHandler) FetchWaiter(w http.ResponseWriter, r *http.Request) {
-	adminID, exists := h.getAdminID(r)
-	if exists != nil {
-		util.JsonError(w, http.StatusUnauthorized, "User not authenticated")
-		return
-	}
-
-	var admin models.Admin
-	err := h.DB.Collection("admins").FindOne(r.Context(), bson.M{"_id": adminID}).Decode(&admin)
+	restaurantID, err := h.restaurantID(r)
 	if err != nil {
-		util.JsonError(w, http.StatusNotFound, "Admin info not found")
-		return
-	}
-
-	if admin.RestaurantID == nil {
 		util.JsonResponse(w, http.StatusOK, map[string]interface{}{
-			"message": "fetched waiter",
-			"waiter":  []models.Waiter{},
+			"message":         "fetched waiter",
+			"waiter":          []interface{}{},
+			"emailConfigured": h.Mailer.Enabled(),
 		})
 		return
 	}
 
 	var waiters []models.Waiter
-	cursor, err := h.DB.Collection("waiters").Find(r.Context(), bson.M{"restaurantId": *admin.RestaurantID})
+	cursor, err := h.DB.Collection("waiters").Find(r.Context(), bson.M{"restaurantId": restaurantID})
 	if err != nil {
 		util.JsonError(w, http.StatusInternalServerError, "Server error")
 		return
 	}
-	defer cursor.Close(r.Context())
 	if err := cursor.All(r.Context(), &waiters); err != nil {
+		log.Printf("decode waiters: %v", err)
 		util.JsonError(w, http.StatusInternalServerError, "Error decoding waiters")
 		return
 	}
 
-	if waiters == nil {
-		waiters = []models.Waiter{}
+	views := make([]map[string]interface{}, 0, len(waiters))
+	for _, waiter := range waiters {
+		views = append(views, waiterView(waiter))
 	}
 
 	util.JsonResponse(w, http.StatusOK, map[string]interface{}{
-		"message": "fetched waiter",
-		"waiter":  waiters,
+		"message":         "fetched waiter",
+		"waiter":          views,
+		"emailConfigured": h.Mailer.Enabled(),
 	})
 }
 
-func (h *AdminHandler) AddRestaurantData(w http.ResponseWriter, r *http.Request) {
-	adminID, exists := h.getAdminID(r)
-	if exists != nil {
-		util.JsonError(w, http.StatusUnauthorized, "Admin not authenticated")
-		return
+func nonNilStrings(in []string) []string {
+	if in == nil {
+		return []string{}
 	}
-
-	err := r.ParseMultipartForm(10 << 20)
-	if err != nil {
-		util.JsonError(w, http.StatusBadRequest, "Error parsing form data")
-		return
-	}
-
-	dataString := r.FormValue("data")
-	if dataString == "" {
-		util.JsonError(w, http.StatusBadRequest, "Data is invalid or empty")
-		return
-	}
-
-	var parsedData struct {
-		Title string                  `json:"title"`
-		Data  []models.RestaurantData `json:"data"`
-	}
-
-	if err := json.Unmarshal([]byte(dataString), &parsedData); err != nil {
-		util.JsonError(w, http.StatusBadRequest, "Invalid JSON in data field")
-		return
-	}
-
-	if parsedData.Title == "" {
-		util.JsonError(w, http.StatusBadRequest, "Title is required")
-		return
-	}
-	if len(parsedData.Data) == 0 {
-		util.JsonError(w, http.StatusBadRequest, "Data is invalid or empty")
-		return
-	}
-	file, _, err := r.FormFile("file")
-	if err != nil {
-		util.JsonError(w, http.StatusBadRequest, "Image file is required")
-		return
-	}
-	defer file.Close()
-
-	uploadedImageURL, err := h.Image.UploadRestaurantImage(r.Context(), file)
-	if err != nil {
-		util.JsonError(w, http.StatusInternalServerError, "Failed to upload image to Cloudinary")
-		return
-	}
-
-	parsedData.Data[0].Image = uploadedImageURL
-
-	newRestaurant := models.Restaurant{
-		ID:        bson.NewObjectID(),
-		Title:     parsedData.Title,
-		Data:      parsedData.Data,
-		CreatedAt: time.Now().UTC(),
-		UpdatedAt: time.Now().UTC(),
-	}
-
-	_, err = h.DB.Collection("restaurants").InsertOne(r.Context(), newRestaurant)
-	if err != nil {
-		util.JsonError(w, http.StatusInternalServerError, "Error saving restaurant data")
-		return
-	}
-
-	update := bson.M{"$set": bson.M{"restaurantId": newRestaurant.ID}}
-	_, err = h.DB.Collection("admins").UpdateByID(r.Context(), adminID, update)
-	if err != nil {
-		util.JsonError(w, http.StatusInternalServerError, "Restaurant created, but failed to link to Admin")
-		return
-	}
-
-	util.JsonResponse(w, http.StatusCreated, map[string]interface{}{
-		"message":    "Restaurant data added successfully",
-		"restaurant": newRestaurant,
-	})
+	return in
 }
