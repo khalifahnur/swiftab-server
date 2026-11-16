@@ -1,8 +1,13 @@
 package handler
 
 import (
+	"context"
+	"fmt"
+	"log"
 	"math"
 	"net/http"
+	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -13,27 +18,47 @@ import (
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
 )
 
-type DailyRevenue struct {
-	ID    string  `bson:"_id"`
-	Value float64 `bson:"value"`
+// bucketStat is one day's (or month's) order activity.
+type bucketStat struct {
+	ID      string  `bson:"_id"`
+	Orders  int     `bson:"orders"`
+	Revenue float64 `bson:"revenue"`
 }
 
-type DailyReservation struct {
+type dailyReservation struct {
 	ID           string `bson:"_id"`
 	Reservations int    `bson:"reservations"`
 	Guests       int    `bson:"guests"`
+	Cancelled    int    `bson:"cancelled"`
 }
 
-type TopItem struct {
-	ID       string  `bson:"_id"`
-	Quantity int     `bson:"quantity"`
-	Revenue  float64 `bson:"revenue"`
+type topItem struct {
+	Name     string  `bson:"_id" json:"name"`
+	Quantity int     `bson:"quantity" json:"quantity"`
+	Revenue  float64 `bson:"revenue" json:"revenue"`
 }
 
-type PaymentAgg struct {
+type paymentAgg struct {
 	ID      string  `bson:"_id"`
 	Count   int     `bson:"count"`
 	Revenue float64 `bson:"revenue"`
+}
+
+type hourAgg struct {
+	Hour   int `bson:"_id"`
+	Orders int `bson:"orders"`
+}
+
+type staffAgg struct {
+	ID      bson.ObjectID `bson:"_id"`
+	Orders  int           `bson:"orders"`
+	Revenue float64       `bson:"revenue"`
+}
+
+type openOrderAgg struct {
+	Status string  `bson:"_id"`
+	Count  int     `bson:"count"`
+	Amount float64 `bson:"amount"`
 }
 
 func pctChange(current, previous float64) int {
@@ -46,183 +71,329 @@ func pctChange(current, previous float64) int {
 	return int(math.Round(((current - previous) / previous) * 100))
 }
 
+// dashboardPeriod describes the reporting window the manager picked.
+type dashboardPeriod struct {
+	Name string
+	// Start is the first instant of the window; PrevStart begins the window
+	// of the same length just before it, used for "vs previous" figures.
+	Start     time.Time
+	PrevStart time.Time
+	Monthly   bool // bucket by month rather than by day
+	Buckets   []periodBucket
+}
+
+type periodBucket struct {
+	Key   string // matches the aggregation's bucket id
+	Label string // what the chart shows on its axis
+}
+
+// resolvePeriod turns ?period= into concrete dates in the business timezone.
+// "weekly" is the last 7 days, "monthly" the last 30, "yearly" the last 12
+// calendar months; anything else falls back to weekly.
+func resolvePeriod(name string, today time.Time) dashboardPeriod {
+	switch name {
+	case "yearly":
+		firstOfMonth := time.Date(today.Year(), today.Month(), 1, 0, 0, 0, 0, today.Location())
+		start := firstOfMonth.AddDate(0, -11, 0)
+		p := dashboardPeriod{Name: "yearly", Start: start, PrevStart: start.AddDate(-1, 0, 0), Monthly: true}
+		for i := 0; i < 12; i++ {
+			m := start.AddDate(0, i, 0)
+			p.Buckets = append(p.Buckets, periodBucket{Key: m.Format("2006-01"), Label: m.Format("Jan")})
+		}
+		return p
+	case "monthly":
+		start := today.AddDate(0, 0, -29)
+		p := dashboardPeriod{Name: "monthly", Start: start, PrevStart: start.AddDate(0, 0, -30)}
+		for i := 0; i < 30; i++ {
+			d := start.AddDate(0, 0, i)
+			p.Buckets = append(p.Buckets, periodBucket{Key: d.Format("2006-01-02"), Label: d.Format("2 Jan")})
+		}
+		return p
+	default:
+		start := today.AddDate(0, 0, -6)
+		p := dashboardPeriod{Name: "weekly", Start: start, PrevStart: start.AddDate(0, 0, -7)}
+		for i := 0; i < 7; i++ {
+			d := start.AddDate(0, 0, i)
+			p.Buckets = append(p.Buckets, periodBucket{Key: d.Format("2006-01-02"), Label: d.Format("Mon")})
+		}
+		return p
+	}
+}
+
+func hourLabel(hour int) string {
+	switch {
+	case hour == 0:
+		return "12 AM"
+	case hour < 12:
+		return fmt.Sprintf("%d AM", hour)
+	case hour == 12:
+		return "12 PM"
+	default:
+		return fmt.Sprintf("%d PM", hour-12)
+	}
+}
+
+// compare packages a figure with the previous period's and the change.
+func compare(current, previous float64) map[string]interface{} {
+	return map[string]interface{}{
+		"value":         current,
+		"previous":      previous,
+		"changePercent": pctChange(current, previous),
+	}
+}
+
 func (h *AdminHandler) GetDashboardStats(w http.ResponseWriter, r *http.Request) {
-	restaurantID, err := h.getRestaurantID(r)
+	restaurantID, err := h.restaurantID(r)
 	if err != nil {
 		util.JsonError(w, http.StatusBadRequest, "Valid Restaurant ID is required")
 		return
 	}
 
+	ctx := r.Context()
+	loc := h.location()
+	tz := loc.String()
 	now := time.Now().UTC()
-	today := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.UTC)
-	sevenDaysAgo := today.Add(-6 * 24 * time.Hour)
-	thirtyDaysAgo := today.Add(-29 * 24 * time.Hour)
-	endOfToday := today.Add(24 * time.Hour).Add(-time.Nanosecond)
+	today := h.startOfDay(now)
+	tomorrow := today.AddDate(0, 0, 1)
+	period := resolvePeriod(r.URL.Query().Get("period"), today)
 
-	todayKey := today.Format("2006-01-02")
-	yesterdayKey := today.Add(-24 * time.Hour).Format("2006-01-02")
+	// The KPI cards always compare today with yesterday over a 7-day
+	// sparkline, whatever period the charts show.
+	sparkStart := today.AddDate(0, 0, -6)
+	dailyStart := sparkStart
+	if !period.Monthly && period.Start.Before(dailyStart) {
+		dailyStart = period.Start
+	}
 
-	// 2. Concurrency Setup for 7 simultaneous queries
+	orders := h.DB.Collection("orders")
+	reservations := h.DB.Collection("reservations")
+
+	dayOf := func(field string) bson.M {
+		return bson.M{"$dateToString": bson.M{"format": "%Y-%m-%d", "date": field, "timezone": tz}}
+	}
+	monthOf := func(field string) bson.M {
+		return bson.M{"$dateToString": bson.M{"format": "%Y-%m", "date": field, "timezone": tz}}
+	}
+	// Revenue only counts bills that were actually settled.
+	paidRevenue := bson.M{"$sum": bson.M{"$cond": bson.A{
+		bson.M{"$eq": bson.A{"$paymentStatus", "paid"}}, "$totalAmount", 0,
+	}}}
+	orderBuckets := func(from, to time.Time, bucket bson.M) bson.A {
+		return bson.A{
+			bson.M{"$match": bson.M{
+				"restaurantId": restaurantID,
+				"orderStatus":  bson.M{"$ne": "cancelled"},
+				"createdAt":    bson.M{"$gte": from, "$lt": to},
+			}},
+			bson.M{"$group": bson.M{"_id": bucket, "orders": bson.M{"$sum": 1}, "revenue": paidRevenue}},
+		}
+	}
+
+	var (
+		dailyOrders   []bucketStat
+		monthlyOrders []bucketStat
+		prevOrders    []bucketStat
+		dailyRes      []dailyReservation
+		prevRes       []dailyReservation
+		topItems      []topItem
+		payments      []paymentAgg
+		hours         []hourAgg
+		staff         []staffAgg
+		openOrders    []openOrderAgg
+		upcoming      []models.Reservation
+		recent        []models.Order
+		layout        *models.RestaurantLayout
+		tableStates   map[string]tableState
+	)
+
 	var wg sync.WaitGroup
-	errChan := make(chan error, 7) // Buffered channel to catch errors without blocking
+	var mu sync.Mutex
+	var firstErr error
 
-	// Data containers
-	var revenueByDay []DailyRevenue
-	var reservationsByDay []DailyReservation
-	var topItemsAgg []TopItem
-	var paymentAgg []PaymentAgg
-	var layout models.RestaurantLayout
-	var upcomingReservations []models.Reservation
-	var recentOrders []models.Order
-
-	wg.Add(7)
-
-	// Query 1: Daily Revenue
-	go func() {
-		defer wg.Done()
-		pipeline := bson.A{
-			bson.M{"$match": bson.M{"restaurantId": restaurantID, "paymentStatus": "paid", "createdAt": bson.M{"$gte": sevenDaysAgo}}},
-			bson.M{"$group": bson.M{"_id": bson.M{"$dateToString": bson.M{"format": "%Y-%m-%d", "date": "$createdAt"}}, "value": bson.M{"$sum": "$totalAmount"}}},
+	run := func(name string, fn func() error) {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := fn(); err != nil {
+				mu.Lock()
+				if firstErr == nil {
+					firstErr = fmt.Errorf("%s: %w", name, err)
+				}
+				mu.Unlock()
+			}
+		}()
+	}
+	aggregate := func(coll string, pipeline bson.A, out interface{}) error {
+		cursor, err := h.DB.Collection(coll).Aggregate(ctx, pipeline)
+		if err != nil {
+			return err
 		}
-		cursor, e := h.DB.Collection("orders").Aggregate(r.Context(), pipeline)
-		if e == nil {
-			e = cursor.All(r.Context(), &revenueByDay)
-		}
-		if e != nil {
-			errChan <- e
-		}
-	}()
+		return cursor.All(ctx, out)
+	}
 
-	// Query 2: Daily Reservations
-	go func() {
-		defer wg.Done()
-		pipeline := bson.A{
-			bson.M{"$match": bson.M{"restaurantId": restaurantID, "status": bson.M{"$ne": "cancelled"}, "reservationInfo.bookingFor": bson.M{"$gte": sevenDaysAgo}}},
+	run("daily orders", func() error {
+		return aggregate("orders", orderBuckets(dailyStart, tomorrow, dayOf("$createdAt")), &dailyOrders)
+	})
+	if period.Monthly {
+		run("monthly orders", func() error {
+			return aggregate("orders", orderBuckets(period.Start, tomorrow, monthOf("$createdAt")), &monthlyOrders)
+		})
+	}
+	run("previous orders", func() error {
+		return aggregate("orders", orderBuckets(period.PrevStart, period.Start, bson.M{"$literal": "all"}), &prevOrders)
+	})
+
+	reservationBuckets := func(from, to time.Time, bucket interface{}) bson.A {
+		isCancelled := bson.M{"$in": bson.A{"$status", bson.A{"cancelled", "no_show"}}}
+		return bson.A{
+			bson.M{"$match": bson.M{
+				"restaurantId":               restaurantID,
+				"reservationInfo.bookingFor": bson.M{"$gte": from, "$lt": to},
+			}},
 			bson.M{"$group": bson.M{
-				"_id":          bson.M{"$dateToString": bson.M{"format": "%Y-%m-%d", "date": "$reservationInfo.bookingFor"}},
-				"reservations": bson.M{"$sum": 1},
-				"guests":       bson.M{"$sum": "$reservationInfo.guests"},
+				"_id":          bucket,
+				"reservations": bson.M{"$sum": bson.M{"$cond": bson.A{isCancelled, 0, 1}}},
+				"guests":       bson.M{"$sum": bson.M{"$cond": bson.A{isCancelled, 0, "$reservationInfo.guests"}}},
+				"cancelled":    bson.M{"$sum": bson.M{"$cond": bson.A{isCancelled, 1, 0}}},
 			}},
 		}
-		cursor, e := h.DB.Collection("reservations").Aggregate(r.Context(), pipeline)
-		if e == nil {
-			e = cursor.All(r.Context(), &reservationsByDay)
-		}
-		if e != nil {
-			errChan <- e
-		}
-	}()
+	}
+	resStart := sparkStart
+	if period.Start.Before(resStart) {
+		resStart = period.Start
+	}
+	run("reservations", func() error {
+		return aggregate("reservations", reservationBuckets(resStart, tomorrow, dayOf("$reservationInfo.bookingFor")), &dailyRes)
+	})
+	run("previous reservations", func() error {
+		return aggregate("reservations", reservationBuckets(period.PrevStart, period.Start, "all"), &prevRes)
+	})
 
-	// Query 3: Top Items
-	go func() {
-		defer wg.Done()
-		pipeline := bson.A{
-			bson.M{"$match": bson.M{"restaurantId": restaurantID, "orderStatus": bson.M{"$ne": "cancelled"}, "createdAt": bson.M{"$gte": thirtyDaysAgo}}},
+	periodOrders := bson.M{
+		"restaurantId": restaurantID,
+		"orderStatus":  bson.M{"$ne": "cancelled"},
+		"createdAt":    bson.M{"$gte": period.Start, "$lt": tomorrow},
+	}
+
+	run("top items", func() error {
+		return aggregate("orders", bson.A{
+			bson.M{"$match": periodOrders},
 			bson.M{"$unwind": "$items"},
 			bson.M{"$group": bson.M{
 				"_id":      "$items.name",
 				"quantity": bson.M{"$sum": "$items.quantity"},
 				"revenue":  bson.M{"$sum": bson.M{"$multiply": bson.A{"$items.cost", "$items.quantity"}}},
 			}},
-			bson.M{"$sort": bson.M{"quantity": -1}},
+			bson.M{"$sort": bson.D{{Key: "quantity", Value: -1}, {Key: "revenue", Value: -1}}},
 			bson.M{"$limit": 5},
-		}
-		cursor, e := h.DB.Collection("orders").Aggregate(r.Context(), pipeline)
-		if e == nil {
-			e = cursor.All(r.Context(), &topItemsAgg)
-		}
-		if e != nil {
-			errChan <- e
-		}
-	}()
+		}, &topItems)
+	})
 
-	// Query 4: Payment Split
-	go func() {
-		defer wg.Done()
-		pipeline := bson.A{
-			bson.M{"$match": bson.M{"restaurantId": restaurantID, "paymentStatus": "paid", "createdAt": bson.M{"$gte": thirtyDaysAgo}}},
+	run("payments", func() error {
+		return aggregate("orders", bson.A{
+			bson.M{"$match": bson.M{
+				"restaurantId":  restaurantID,
+				"paymentStatus": "paid",
+				"createdAt":     bson.M{"$gte": period.Start, "$lt": tomorrow},
+			}},
 			bson.M{"$group": bson.M{"_id": "$paymentMethod", "count": bson.M{"$sum": 1}, "revenue": bson.M{"$sum": "$totalAmount"}}},
-			bson.M{"$sort": bson.M{"count": -1}},
-		}
-		cursor, e := h.DB.Collection("orders").Aggregate(r.Context(), pipeline)
-		if e == nil {
-			e = cursor.All(r.Context(), &paymentAgg)
-		}
-		if e != nil {
-			errChan <- e
-		}
-	}()
+			bson.M{"$sort": bson.M{"revenue": -1}},
+		}, &payments)
+	})
 
-	// Query 5: Layout
-	go func() {
-		defer wg.Done()
-		_ = h.DB.Collection("restaurantlayouts").FindOne(r.Context(), bson.M{"restaurantId": restaurantID}).Decode(&layout)
-		// Ignored error explicitly since layout might not exist yet
-	}()
+	run("peak hours", func() error {
+		return aggregate("orders", bson.A{
+			bson.M{"$match": periodOrders},
+			bson.M{"$group": bson.M{
+				"_id":    bson.M{"$hour": bson.M{"date": "$createdAt", "timezone": tz}},
+				"orders": bson.M{"$sum": 1},
+			}},
+		}, &hours)
+	})
 
-	// Query 6: Upcoming Reservations Today
-	go func() {
-		defer wg.Done()
-		filter := bson.M{
+	run("staff", func() error {
+		match := bson.M{}
+		for k, v := range periodOrders {
+			match[k] = v
+		}
+		match["servedBy"] = bson.M{"$type": "objectId"}
+		return aggregate("orders", bson.A{
+			bson.M{"$match": match},
+			bson.M{"$group": bson.M{"_id": "$servedBy", "orders": bson.M{"$sum": 1}, "revenue": paidRevenue}},
+			bson.M{"$sort": bson.M{"orders": -1}},
+			bson.M{"$limit": 5},
+		}, &staff)
+	})
+
+	run("open orders", func() error {
+		return aggregate("orders", bson.A{
+			bson.M{"$match": bson.M{
+				"restaurantId": restaurantID,
+				"orderStatus":  bson.M{"$in": bson.A{"placed", "served", "ready_to_pay"}},
+				"createdAt":    bson.M{"$gte": now.Add(-openOrderWindow)},
+			}},
+			bson.M{"$group": bson.M{"_id": "$orderStatus", "count": bson.M{"$sum": 1}, "amount": bson.M{"$sum": "$totalAmount"}}},
+		}, &openOrders)
+	})
+
+	run("upcoming reservations", func() error {
+		opts := options.Find().SetSort(bson.M{"reservationInfo.bookingFor": 1}).SetLimit(6)
+		cursor, err := reservations.Find(ctx, bson.M{
 			"restaurantId":               restaurantID,
 			"status":                     "active",
-			"reservationInfo.bookingFor": bson.M{"$gte": now, "$lte": endOfToday},
+			"reservationInfo.bookingFor": bson.M{"$gte": now.Add(-15 * time.Minute), "$lt": tomorrow},
+		}, opts)
+		if err != nil {
+			return err
 		}
-		opts := options.Find().SetSort(bson.M{"reservationInfo.bookingFor": 1}).SetLimit(5)
-		cursor, e := h.DB.Collection("reservations").Find(r.Context(), filter, opts)
-		if e == nil {
-			e = cursor.All(r.Context(), &upcomingReservations)
-		}
-		if e != nil {
-			errChan <- e
-		}
-	}()
+		return cursor.All(ctx, &upcoming)
+	})
 
-	// Query 7: Recent Orders
-	go func() {
-		defer wg.Done()
+	run("recent orders", func() error {
 		opts := options.Find().SetSort(bson.M{"createdAt": -1}).SetLimit(5)
-		cursor, e := h.DB.Collection("orders").Find(r.Context(), bson.M{"restaurantId": restaurantID}, opts)
-		if e == nil {
-			e = cursor.All(r.Context(), &recentOrders)
+		cursor, err := orders.Find(ctx, bson.M{"restaurantId": restaurantID}, opts)
+		if err != nil {
+			return err
 		}
-		if e != nil {
-			errChan <- e
-		}
-	}()
+		return cursor.All(ctx, &recent)
+	})
 
-	// Wait for all queries to finish
+	run("layout", func() error {
+		var err error
+		layout, err = h.loadLayout(ctx, restaurantID)
+		return err
+	})
+	run("table states", func() error {
+		var err error
+		tableStates, err = h.liveTableStates(r, restaurantID, now)
+		return err
+	})
+
 	wg.Wait()
-	close(errChan)
-
-	// Check if any query failed fatally
-	if len(errChan) > 0 {
+	if firstErr != nil {
+		log.Printf("dashboard: %v", firstErr)
 		util.JsonError(w, http.StatusInternalServerError, "Failed to fetch dashboard statistics")
 		return
 	}
 
-	// 3. Data Processing & Formatting (O(1) lookups)
-	revMap := make(map[string]float64)
-	for _, r := range revenueByDay {
-		revMap[r.ID] = r.Value
+	// --- Index the daily figures -------------------------------------------
+	ordersByDay := map[string]bucketStat{}
+	for _, b := range dailyOrders {
+		ordersByDay[b.ID] = b
+	}
+	resByDay := map[string]dailyReservation{}
+	for _, b := range dailyRes {
+		resByDay[b.ID] = b
 	}
 
-	resMap := make(map[string]int)
-	guestsMap := make(map[string]int)
-	for _, r := range reservationsByDay {
-		resMap[r.ID] = r.Reservations
-		guestsMap[r.ID] = r.Guests
-	}
+	dayKey := func(offset int) string { return today.AddDate(0, 0, offset).Format("2006-01-02") }
 
-	// KPI Builder Helper
-	buildKpi := func(m map[string]float64) map[string]interface{} {
-		t := m[todayKey]
-		y := m[yesterdayKey]
-		spark := make([]map[string]float64, 7)
-		for i := 0; i < 7; i++ {
-			d := today.Add(time.Duration(i-6) * 24 * time.Hour).Format("2006-01-02")
-			spark[i] = map[string]float64{"value": m[d]}
+	kpi := func(value func(day string) float64) map[string]interface{} {
+		spark := make([]map[string]float64, 0, 7)
+		for i := -6; i <= 0; i++ {
+			spark = append(spark, map[string]float64{"value": value(dayKey(i))})
 		}
+		t, y := value(dayKey(0)), value(dayKey(-1))
 		return map[string]interface{}{
 			"today":         t,
 			"yesterday":     y,
@@ -231,138 +402,275 @@ func (h *AdminHandler) GetDashboardStats(w http.ResponseWriter, r *http.Request)
 		}
 	}
 
-	// Int variation of KPI Builder
-	buildKpiInt := func(m map[string]int) map[string]interface{} {
-		t := m[todayKey]
-		y := m[yesterdayKey]
-		spark := make([]map[string]int, 7)
-		for i := 0; i < 7; i++ {
-			d := today.Add(time.Duration(i-6) * 24 * time.Hour).Format("2006-01-02")
-			spark[i] = map[string]int{"value": m[d]}
-		}
-		return map[string]interface{}{
-			"today":         t,
-			"yesterday":     y,
-			"changePercent": pctChange(float64(t), float64(y)),
-			"sparkline":     spark,
+	// --- Trend for the chosen period ---------------------------------------
+	source := ordersByDay
+	if period.Monthly {
+		source = map[string]bucketStat{}
+		for _, b := range monthlyOrders {
+			source[b.ID] = b
 		}
 	}
-
-	// Format Weekly Revenue
-	var formattedWeeklyRevenue []map[string]interface{}
-	for i := 0; i < 7; i++ {
-		d := sevenDaysAgo.Add(time.Duration(i) * 24 * time.Hour)
-		dayStr := d.Format("2006-01-02")
-		formattedWeeklyRevenue = append(formattedWeeklyRevenue, map[string]interface{}{
-			"day":     d.Weekday().String()[:3], // "Sun", "Mon", etc.
-			"revenue": revMap[dayStr],
+	trend := make([]map[string]interface{}, 0, len(period.Buckets))
+	var revenueTotal float64
+	var ordersTotal int
+	for _, b := range period.Buckets {
+		stat := source[b.Key]
+		revenueTotal += stat.Revenue
+		ordersTotal += stat.Orders
+		trend = append(trend, map[string]interface{}{
+			"label":   b.Label,
+			"date":    b.Key,
+			"revenue": stat.Revenue,
+			"orders":  stat.Orders,
 		})
 	}
 
-	// Area Occupancy Logic
-	type AreaBucket struct {
-		Area     string
-		Occupied int
-		Total    int
-	}
-	buckets := make(map[string]*AreaBucket)
-	for _, area := range layout.DiningAreas {
-		buckets[area] = &AreaBucket{Area: area, Occupied: 0, Total: 0}
+	weeklyRevenue := make([]map[string]interface{}, 0, 7)
+	for i := -6; i <= 0; i++ {
+		d := today.AddDate(0, 0, i)
+		stat := ordersByDay[d.Format("2006-01-02")]
+		weeklyRevenue = append(weeklyRevenue, map[string]interface{}{
+			"day":     d.Format("Mon"),
+			"revenue": stat.Revenue,
+			"orders":  stat.Orders,
+		})
 	}
 
-	for _, table := range layout.TablePosition {
-		key := table.FloorID
-		if key == "" {
-			key = "Other"
-		}
-		if _, exists := buckets[key]; !exists {
-			buckets[key] = &AreaBucket{Area: key, Occupied: 0, Total: 0}
-		}
-		buckets[key].Total++
-		if table.Status == "occupied" { // Match your Node.js status string
-			buckets[key].Occupied++
+	var reservationsTotal, cancelledTotal int
+	for day, b := range resByDay {
+		if day >= period.Start.Format("2006-01-02") {
+			reservationsTotal += b.Reservations
+			cancelledTotal += b.Cancelled
 		}
 	}
 
-	var areaOccupancy []map[string]interface{}
-	for _, b := range buckets {
+	var prevRevenue float64
+	var prevOrderCount int
+	if len(prevOrders) > 0 {
+		prevRevenue, prevOrderCount = prevOrders[0].Revenue, prevOrders[0].Orders
+	}
+	var prevReservations, prevCancelled int
+	if len(prevRes) > 0 {
+		prevReservations, prevCancelled = prevRes[0].Reservations, prevRes[0].Cancelled
+	}
+
+	average := func(total float64, count int) float64 {
+		if count == 0 {
+			return 0
+		}
+		return math.Round(total / float64(count))
+	}
+	rate := func(part, whole int) float64 {
+		if whole == 0 {
+			return 0
+		}
+		return math.Round(float64(part)/float64(whole)*1000) / 10
+	}
+
+	summary := map[string]interface{}{
+		"revenue":          compare(revenueTotal, prevRevenue),
+		"orders":           compare(float64(ordersTotal), float64(prevOrderCount)),
+		"avgOrderValue":    compare(average(revenueTotal, ordersTotal), average(prevRevenue, prevOrderCount)),
+		"reservations":     compare(float64(reservationsTotal), float64(prevReservations)),
+		"cancellationRate": compare(rate(cancelledTotal, reservationsTotal+cancelledTotal), rate(prevCancelled, prevReservations+prevCancelled)),
+	}
+
+	// --- Live floor ----------------------------------------------------------
+	type areaBucket struct {
+		Area                      string
+		Occupied, Reserved, Total int
+	}
+	areas := make([]*areaBucket, 0, len(layout.Floors))
+	areaByFloor := map[string]*areaBucket{}
+	for _, f := range layout.Floors {
+		a := &areaBucket{Area: f.Name}
+		areas = append(areas, a)
+		areaByFloor[f.ID] = a
+	}
+
+	var seated, reserved, activeGuests int
+	for _, t := range layout.TablePosition {
+		a := areaByFloor[t.FloorID]
+		if a == nil {
+			a = &areaBucket{Area: "Other"}
+			areas = append(areas, a)
+			areaByFloor[t.FloorID] = a
+		}
+		a.Total++
+		switch tableStates[t.Name].Status {
+		case "occupied":
+			a.Occupied++
+			seated++
+			activeGuests += tableStates[t.Name].Guests
+		case "reserved":
+			a.Reserved++
+			reserved++
+		}
+	}
+
+	areaOccupancy := make([]map[string]interface{}, 0, len(areas))
+	for _, a := range areas {
 		percentage := 0
-		if b.Total > 0 {
-			percentage = int(math.Round((float64(b.Occupied) / float64(b.Total)) * 100))
+		if a.Total > 0 {
+			percentage = int(math.Round(float64(a.Occupied) / float64(a.Total) * 100))
 		}
 		areaOccupancy = append(areaOccupancy, map[string]interface{}{
-			"area":       b.Area,
-			"occupied":   b.Occupied,
-			"total":      b.Total,
+			"area":       a.Area,
+			"occupied":   a.Occupied,
+			"reserved":   a.Reserved,
+			"total":      a.Total,
 			"percentage": percentage,
 		})
 	}
 
-	// Payment Methods
-	totalPayments := 0
-	for _, p := range paymentAgg {
-		totalPayments += p.Count
+	totalTables := len(layout.TablePosition)
+	occupancyRate := 0
+	if totalTables > 0 {
+		occupancyRate = int(math.Round(float64(seated) / float64(totalTables) * 100))
 	}
 
-	var formattedPaymentMethods []map[string]interface{}
-	for _, p := range paymentAgg {
-		if p.ID == "" { // Ignore empty IDs like in Node
-			continue
+	var openCount, awaitingPayment int
+	var unpaidAmount float64
+	for _, o := range openOrders {
+		openCount += o.Count
+		unpaidAmount += o.Amount
+		if o.Status == string(models.OrderReadyToPay) {
+			awaitingPayment = o.Count
+		}
+	}
+
+	todayRes := resByDay[dayKey(0)]
+	live := map[string]interface{}{
+		"reservationsToday": todayRes.Reservations,
+		"guestsToday":       todayRes.Guests,
+		"seatedTables":      seated,
+		"reservedTables":    reserved,
+		"totalTables":       totalTables,
+		"totalSeats":        capacityOf(layout.TablePosition),
+		"occupancyRate":     occupancyRate,
+		"activeGuests":      activeGuests,
+		"openOrders":        openCount,
+		"awaitingPayment":   awaitingPayment,
+		"unpaidAmount":      unpaidAmount,
+	}
+
+	// --- Payment split -------------------------------------------------------
+	var paidTotal float64
+	for _, p := range payments {
+		paidTotal += p.Revenue
+	}
+	paymentMethods := make([]map[string]interface{}, 0, len(payments))
+	for _, p := range payments {
+		method := p.ID
+		if method == "" {
+			method = "unspecified"
 		}
 		percentage := 0
-		if totalPayments > 0 {
-			percentage = int(math.Round((float64(p.Count) / float64(totalPayments)) * 100))
+		if paidTotal > 0 {
+			percentage = int(math.Round(p.Revenue / paidTotal * 100))
 		}
-		formattedPaymentMethods = append(formattedPaymentMethods, map[string]interface{}{
-			"method":     p.ID,
+		label := paymentLabel(method)
+		if method == "unspecified" {
+			label = "Not recorded"
+		}
+		paymentMethods = append(paymentMethods, map[string]interface{}{
+			"method":     method,
+			"label":      label,
 			"count":      p.Count,
 			"revenue":    p.Revenue,
 			"percentage": percentage,
 		})
 	}
 
-	// Format Upcoming Reservations
-	var formattedReservations []map[string]interface{}
-	for _, r := range upcomingReservations {
-		formattedReservations = append(formattedReservations, map[string]interface{}{
-			"_id":         r.ID.Hex(),
-			"name":        r.ReservationInfo.Name,
-			"time":        r.ReservationInfo.BookingFor,
-			"guests":      r.ReservationInfo.Guests,
-			"tableNumber": r.ReservationInfo.TableNumber,
-			"diningArea":  r.ReservationInfo.DiningArea,
+	// --- Peak hours ----------------------------------------------------------
+	sort.Slice(hours, func(i, j int) bool { return hours[i].Hour < hours[j].Hour })
+	peakHours := make([]map[string]interface{}, 0, len(hours))
+	for _, hr := range hours {
+		peakHours = append(peakHours, map[string]interface{}{
+			"hour":   hr.Hour,
+			"label":  hourLabel(hr.Hour),
+			"orders": hr.Orders,
 		})
 	}
 
-	// Ensure no nulls in final JSON
-	if topItemsAgg == nil {
-		topItemsAgg = []TopItem{}
-	}
-	if areaOccupancy == nil {
-		areaOccupancy = []map[string]interface{}{}
-	}
-	if formattedPaymentMethods == nil {
-		formattedPaymentMethods = []map[string]interface{}{}
-	}
-	if formattedReservations == nil {
-		formattedReservations = []map[string]interface{}{}
-	}
-	if recentOrders == nil {
-		recentOrders = []models.Order{}
+	// --- Staff ---------------------------------------------------------------
+	staffRows := make([]map[string]interface{}, 0, len(staff))
+	if len(staff) > 0 {
+		ids := make(bson.A, 0, len(staff))
+		for _, s := range staff {
+			ids = append(ids, s.ID)
+		}
+		names := h.waiterNames(ctx, ids)
+		for _, s := range staff {
+			name, ok := names[s.ID]
+			if !ok {
+				name = "Former staff"
+			}
+			staffRows = append(staffRows, map[string]interface{}{
+				"id":      s.ID.Hex(),
+				"name":    name,
+				"orders":  s.Orders,
+				"revenue": s.Revenue,
+			})
+		}
 	}
 
-	// 4. Final JSON Construction
+	upcomingRows := make([]map[string]interface{}, 0, len(upcoming))
+	for _, res := range upcoming {
+		upcomingRows = append(upcomingRows, map[string]interface{}{
+			"_id":         res.ID.Hex(),
+			"name":        res.ReservationInfo.Name,
+			"time":        res.ReservationInfo.BookingFor,
+			"guests":      res.ReservationInfo.Guests,
+			"tableNumber": res.ReservationInfo.TableNumber,
+			"diningArea":  res.ReservationInfo.DiningArea,
+		})
+	}
+
+	if topItems == nil {
+		topItems = []topItem{}
+	}
+	if recent == nil {
+		recent = []models.Order{}
+	}
+
 	util.JsonResponse(w, http.StatusOK, map[string]interface{}{
+		"period":   period.Name,
+		"timezone": tz,
+		"live":     live,
 		"kpiTrends": map[string]interface{}{
-			"revenue":      buildKpi(revMap),
-			"reservations": buildKpiInt(resMap),
-			"guests":       buildKpiInt(guestsMap),
+			"revenue":      kpi(func(d string) float64 { return ordersByDay[d].Revenue }),
+			"orders":       kpi(func(d string) float64 { return float64(ordersByDay[d].Orders) }),
+			"reservations": kpi(func(d string) float64 { return float64(resByDay[d].Reservations) }),
+			"guests":       kpi(func(d string) float64 { return float64(resByDay[d].Guests) }),
 		},
-		"weeklyRevenue":        formattedWeeklyRevenue,
+		"summary":              summary,
+		"trend":                trend,
+		"weeklyRevenue":        weeklyRevenue,
 		"areaOccupancy":        areaOccupancy,
-		"topItems":             topItemsAgg,
-		"paymentMethods":       formattedPaymentMethods,
-		"upcomingReservations": formattedReservations,
-		"recentOrders":         recentOrders,
+		"topItems":             topItems,
+		"paymentMethods":       paymentMethods,
+		"peakHours":            peakHours,
+		"staff":                staffRows,
+		"upcomingReservations": upcomingRows,
+		"recentOrders":         recent,
 	})
+}
+
+// waiterNames resolves waiter ids to display names.
+func (b *Base) waiterNames(ctx context.Context, ids bson.A) map[bson.ObjectID]string {
+	names := map[bson.ObjectID]string{}
+	opts := options.Find().SetProjection(bson.M{"firstname": 1, "lastname": 1})
+	cursor, err := b.DB.Collection("waiters").Find(ctx, bson.M{"_id": bson.M{"$in": ids}}, opts)
+	if err != nil {
+		return names
+	}
+	var waiters []models.Waiter
+	if err := cursor.All(ctx, &waiters); err != nil {
+		return names
+	}
+	for _, w := range waiters {
+		names[w.ID] = strings.TrimSpace(w.FirstName + " " + w.LastName)
+	}
+	return names
 }

@@ -13,8 +13,8 @@ type Admin struct {
 	Password                   string         `bson:"password" json:"-"`
 	PhoneNumber                string         `bson:"phoneNumber" json:"phoneNumber"`
 	RestaurantID               *bson.ObjectID `bson:"restaurantId,omitempty" json:"restaurantId,omitempty"`
-	VerificationCode           string         `bson:"verificationCode,omitempty" json:"verificationCode,omitempty"`
-	VerificationCodeExpiration *time.Time     `bson:"verificationCodeExpiration,omitempty" json:"verificationCodeExpiration,omitempty"`
+	VerificationCode           string         `bson:"verificationCode,omitempty" json:"-"`
+	VerificationCodeExpiration *time.Time     `bson:"verificationCodeExpiration,omitempty" json:"-"`
 	CreatedAt                  time.Time      `bson:"createdAt" json:"createdAt"`
 	UpdatedAt                  time.Time      `bson:"updatedAt" json:"updatedAt"`
 }
