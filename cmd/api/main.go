@@ -201,6 +201,11 @@ func newRouter(base *handler.Base, auth *middleware.Auth) *http.ServeMux {
 	route("PUT /users/orders/{orderId}/complete", orders.UserCompleteOrder, auth.Mobile)
 	route("PUT /users/orders/{orderId}/cancel", orders.UserCancelOrder, auth.Mobile)
 
+	// Sharing a booking's menu so friends can add dishes to the host's bill.
+	route("GET /users/{userId}/reservations/{reservationId}/tab", dine.UserTab, auth.Mobile)
+	route("POST /users/{userId}/reservations/{reservationId}/tab", dine.UserShareTab, auth.Mobile)
+	route("DELETE /users/{userId}/reservations/{reservationId}/tab", dine.UserStopTab, auth.Mobile)
+
 	// --- Guests who scan a table's QR code ---------------------------------------
 	// The code in the link is checked on every table request; after check-in
 	// the guest token only reaches that one visit.
@@ -210,6 +215,14 @@ func newRouter(base *handler.Base, auth *middleware.Auth) *http.ServeMux {
 	route("POST /dine/visit/orders", dine.PlaceOrder)
 	route("PUT /dine/visit/orders/{orderId}/bill", dine.RequestBill)
 	route("PUT /dine/visit/orders/{orderId}/cancel", dine.CancelOrder)
+	route("POST /dine/visit/tab", dine.VisitShareTab)
+	route("DELETE /dine/visit/tab", dine.VisitStopTab)
+
+	// --- Friends who open a shared tab link ----------------------------------------
+	// The link's code finds the booking; joining returns a guest token that
+	// only adds dishes to that tab, and stops working when the host stops sharing.
+	route("GET /tab/{code}", dine.TabPreview)
+	route("POST /tab/{code}/join", dine.JoinTab)
 
 	// --- Waiter app ----------------------------------------------------------
 	route("GET /waiters/restaurants/{restaurantId}/orders", orders.GetWaiterOrders, auth.Mobile)

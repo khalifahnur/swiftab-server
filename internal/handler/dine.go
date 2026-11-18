@@ -393,19 +393,13 @@ func (h *DineHandler) CheckIn(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 
-	// The token outlives the stay a little, so a guest can still see their
-	// receipt after paying.
-	expiry := time.Until(visit.ReservationInfo.EndTime) + 4*time.Hour
-	if expiry < 6*time.Hour {
-		expiry = 6 * time.Hour
-	}
-	token, err := util.GenerateGuestToken(restaurant.ID.Hex(), visit.ReservationInfo.ReservationID, expiry)
+	token, err := util.GenerateGuestToken(restaurant.ID.Hex(), visit.ReservationInfo.ReservationID, visitTokenExpiry(&visit))
 	if err != nil {
 		util.JsonError(w, http.StatusInternalServerError, "Could not start your visit")
 		return
 	}
 
-	body, err := h.visitBody(ctx, restaurant, layout, &visit)
+	body, err := h.visitBody(ctx, restaurant, layout, &visit, nil)
 	if err != nil {
 		util.JsonError(w, http.StatusInternalServerError, "Could not load your visit")
 		return
@@ -417,27 +411,48 @@ func (h *DineHandler) CheckIn(w http.ResponseWriter, r *http.Request) {
 
 // --- Guest session -------------------------------------------------------------
 
-// guestVisit loads the visit a guest token is for.
-func (h *DineHandler) guestVisit(w http.ResponseWriter, r *http.Request) (*models.Reservation, bool) {
+// visitTokenExpiry outlives the stay a little, so a guest can still see
+// their receipt after paying.
+func visitTokenExpiry(visit *models.Reservation) time.Duration {
+	expiry := time.Until(visit.ReservationInfo.EndTime) + 4*time.Hour
+	if expiry < 6*time.Hour {
+		expiry = 6 * time.Hour
+	}
+	return expiry
+}
+
+const visitEnded = "Your visit has ended. Scan the code on your table to start again."
+
+// guestVisit loads the visit a guest token is for. friend is set when the
+// token belongs to someone who joined the host's shared tab; their token
+// only works while the host keeps sharing.
+func (h *DineHandler) guestVisit(w http.ResponseWriter, r *http.Request) (visit *models.Reservation, friend *models.TabGuest, ok bool) {
 	claims, err := util.ParseToken(bearer(r))
 	if err != nil || claims.Role != util.RoleGuest || claims.ReservationID == "" {
-		util.JsonError(w, http.StatusUnauthorized, "Your visit has ended. Scan the code on your table to start again.")
-		return nil, false
+		util.JsonError(w, http.StatusUnauthorized, visitEnded)
+		return nil, nil, false
 	}
 	restaurantID, err := bson.ObjectIDFromHex(claims.RestaurantID)
 	if err != nil {
-		util.JsonError(w, http.StatusUnauthorized, "Your visit has ended. Scan the code on your table to start again.")
-		return nil, false
+		util.JsonError(w, http.StatusUnauthorized, visitEnded)
+		return nil, nil, false
 	}
-	var visit models.Reservation
+	var res models.Reservation
 	if err := h.DB.Collection("reservations").FindOne(r.Context(), bson.M{
 		"restaurantId":                  restaurantID,
 		"reservationInfo.reservationID": claims.ReservationID,
-	}).Decode(&visit); err != nil {
-		util.JsonError(w, http.StatusUnauthorized, "Your visit has ended. Scan the code on your table to start again.")
-		return nil, false
+	}).Decode(&res); err != nil {
+		util.JsonError(w, http.StatusUnauthorized, visitEnded)
+		return nil, nil, false
 	}
-	return &visit, true
+	if claims.TabCode != "" {
+		friend = res.Tab.Guest(claims.GuestID)
+		if !res.Tab.IsOpen() || res.Tab.Code != claims.TabCode || friend == nil {
+			util.JsonError(w, http.StatusUnauthorized, "The host stopped sharing this tab. Ask them for a new link.")
+			return nil, nil, false
+		}
+	}
+	return &res, friend, true
 }
 
 func bearer(r *http.Request) string {
@@ -448,9 +463,45 @@ func bearer(r *http.Request) string {
 	return ""
 }
 
+// hostName is how friends on a shared tab see the host: their first name.
+func hostName(visit *models.Reservation) string {
+	if parts := strings.Fields(visit.ReservationInfo.Name); len(parts) > 0 {
+		return parts[0]
+	}
+	return "Your host"
+}
+
+// friendLines keeps the lines one friend added to a shared tab.
+func friendLines(items []models.MenuItem, guestID string) []models.MenuItem {
+	out := []models.MenuItem{}
+	for _, item := range items {
+		if item.AddedByID == guestID {
+			out = append(out, item)
+		}
+	}
+	return out
+}
+
+// visitOrders loads every order on a visit, newest first, with the waiter
+// who served it.
+func (h *DineHandler) visitOrders(ctx context.Context, restaurantID bson.ObjectID, reservationID string) ([]aggFloorOrder, error) {
+	cursor, err := h.DB.Collection("orders").Aggregate(ctx, bson.A{
+		bson.M{"$match": bson.M{"restaurantId": restaurantID, "reservationId": reservationID}},
+		bson.M{"$sort": bson.M{"createdAt": -1}},
+		bson.M{"$lookup": bson.M{"from": "waiters", "localField": "servedBy", "foreignField": "_id", "as": "waiter"}},
+	})
+	if err != nil {
+		return nil, err
+	}
+	var rows []aggFloorOrder
+	err = cursor.All(ctx, &rows)
+	return rows, err
+}
+
 // visitBody is what the guest page shows: where they are, their visit and
-// every order on it.
-func (h *DineHandler) visitBody(ctx context.Context, restaurant *models.Restaurant, layout *models.RestaurantLayout, visit *models.Reservation) (map[string]interface{}, error) {
+// its orders. A friend on a shared tab sees only the dishes they added; the
+// host also gets the tab's share link and who has joined.
+func (h *DineHandler) visitBody(ctx context.Context, restaurant *models.Restaurant, layout *models.RestaurantLayout, visit *models.Reservation, friend *models.TabGuest) (map[string]interface{}, error) {
 	info := visit.ReservationInfo
 	table := map[string]interface{}{"id": "", "name": info.TableNumber, "floor": info.DiningArea, "seats": 0}
 	if layout != nil {
@@ -462,15 +513,8 @@ func (h *DineHandler) visitBody(ctx context.Context, restaurant *models.Restaura
 		}
 	}
 
-	cursor, err := h.DB.Collection("orders").Aggregate(ctx, append(bson.A{
-		bson.M{"$match": bson.M{"restaurantId": restaurant.ID, "reservationId": info.ReservationID}},
-		bson.M{"$sort": bson.M{"createdAt": -1}},
-	}, bson.M{"$lookup": bson.M{"from": "waiters", "localField": "servedBy", "foreignField": "_id", "as": "waiter"}}))
+	rows, err := h.visitOrders(ctx, restaurant.ID, info.ReservationID)
 	if err != nil {
-		return nil, err
-	}
-	var rows []aggFloorOrder
-	if err := cursor.All(ctx, &rows); err != nil {
 		return nil, err
 	}
 	orders := make([]map[string]interface{}, 0, len(rows))
@@ -478,6 +522,13 @@ func (h *DineHandler) visitBody(ctx context.Context, restaurant *models.Restaura
 		items := o.Items
 		if items == nil {
 			items = []models.MenuItem{}
+		}
+		total := o.TotalAmount
+		if friend != nil {
+			if items = friendLines(items, friend.ID); len(items) == 0 {
+				continue
+			}
+			total = orderTotal(items)
 		}
 		waiter := ""
 		if len(o.Waiter) > 0 {
@@ -492,7 +543,7 @@ func (h *DineHandler) visitBody(ctx context.Context, restaurant *models.Restaura
 			"orderId":       o.OrderNumber,
 			"status":        o.OrderStatus,
 			"items":         items,
-			"totalAmount":   o.TotalAmount,
+			"totalAmount":   total,
 			"paymentMethod": o.PaymentMethod,
 			"paymentStatus": paymentStatus,
 			"createdAt":     o.CreatedAt,
@@ -503,50 +554,74 @@ func (h *DineHandler) visitBody(ctx context.Context, restaurant *models.Restaura
 		})
 	}
 
-	return map[string]interface{}{
+	name := info.Name
+	you := map[string]interface{}{"role": "host", "name": info.Name}
+	if friend != nil {
+		name = hostName(visit)
+		you = map[string]interface{}{"role": "friend", "id": friend.ID, "name": friend.Name, "host": name}
+	}
+	body := map[string]interface{}{
 		"restaurant": restaurantSummary(restaurant),
 		"table":      table,
 		"visit": map[string]interface{}{
 			"reservationId": info.ReservationID,
-			"name":          info.Name,
+			"name":          name,
 			"guests":        info.Guests,
 			"status":        visit.Status,
 			"since":         info.BookingFor,
 			"until":         info.EndTime,
 			"open":          visit.Status == models.ReservationSeated || visit.Status == models.ReservationActive,
 		},
+		"you":    you,
 		"orders": orders,
-	}, nil
+	}
+	if friend == nil {
+		body["tab"] = h.tabSummary(visit, rows)
+	}
+	return body, nil
 }
 
 // Visit returns the guest's visit and its orders. The guest page polls it to
 // follow an order from the kitchen to the bill.
 func (h *DineHandler) Visit(w http.ResponseWriter, r *http.Request) {
-	visit, ok := h.guestVisit(w, r)
+	visit, friend, ok := h.guestVisit(w, r)
 	if !ok {
 		return
 	}
+	h.respondVisit(w, r, visit, friend, http.StatusOK, nil)
+}
+
+// respondVisit writes the visit body, with any extra fields.
+func (h *DineHandler) respondVisit(w http.ResponseWriter, r *http.Request, visit *models.Reservation, friend *models.TabGuest, status int, extra map[string]interface{}) {
 	restaurant, err := h.loadRestaurant(r.Context(), visit.RestaurantID)
 	if err != nil || len(restaurant.Data) == 0 {
 		util.JsonError(w, http.StatusNotFound, "Restaurant not found")
 		return
 	}
 	layout, _ := h.loadLayout(r.Context(), visit.RestaurantID)
-	body, err := h.visitBody(r.Context(), restaurant, layout, visit)
+	body, err := h.visitBody(r.Context(), restaurant, layout, visit, friend)
 	if err != nil {
 		util.JsonError(w, http.StatusInternalServerError, "Could not load your visit")
 		return
 	}
-	util.JsonResponse(w, http.StatusOK, body)
+	for k, v := range extra {
+		body[k] = v
+	}
+	util.JsonResponse(w, status, body)
 }
 
-// PlaceOrder sends a guest's dishes to the kitchen for their table.
+// PlaceOrder sends a guest's dishes to the kitchen for their table. A friend
+// on a shared tab adds them to the host's bill.
 func (h *DineHandler) PlaceOrder(w http.ResponseWriter, r *http.Request) {
-	visit, ok := h.guestVisit(w, r)
+	visit, friend, ok := h.guestVisit(w, r)
 	if !ok {
 		return
 	}
 	if visit.Status != models.ReservationSeated && visit.Status != models.ReservationActive {
+		if friend != nil {
+			util.JsonError(w, http.StatusConflict, "This booking has ended, so nothing more can be added to the tab.")
+			return
+		}
 		util.JsonError(w, http.StatusConflict, "Your visit has ended. Scan the code on your table to order again.")
 		return
 	}
@@ -557,13 +632,18 @@ func (h *DineHandler) PlaceOrder(w http.ResponseWriter, r *http.Request) {
 		util.JsonError(w, http.StatusBadRequest, "Invalid request body")
 		return
 	}
-	h.Orders.placeOrder(w, r, visit, req.Menu, "")
+	h.Orders.placeOrder(w, r, visit, req.Menu, "", friend)
 }
 
-// guestOrder loads one of the guest's own orders.
+// guestOrder loads one of the visit's orders for the host. Friends on a
+// shared tab cannot ask for the bill or cancel: the host pays.
 func (h *DineHandler) guestOrder(w http.ResponseWriter, r *http.Request) *models.Order {
-	visit, ok := h.guestVisit(w, r)
+	visit, friend, ok := h.guestVisit(w, r)
 	if !ok {
+		return nil
+	}
+	if friend != nil {
+		util.JsonError(w, http.StatusForbidden, "Only "+hostName(visit)+" can cancel the order or ask for the bill.")
 		return nil
 	}
 	orderID, err := bson.ObjectIDFromHex(r.PathValue("orderId"))

@@ -325,3 +325,58 @@ func TestGuestTokenCannotOpenDinerOrWaiterRoutes(t *testing.T) {
 		t.Errorf("GET /admin/orders with a guest token: got %d, want 401", rec.Code)
 	}
 }
+
+func TestSharedTabRoutes(t *testing.T) {
+	mux := testRouter(false)
+	host := "65f0c0c0c0c0c0c0c0c0c0c2"
+	other := "65f0c0c0c0c0c0c0c0c0c0c9"
+	token, _ := util.GenerateUserToken(host, "u@example.com", time.Hour)
+	waiter, _ := util.GenerateWaiterToken("65f0c0c0c0c0c0c0c0c0c0c3", "65f0c0c0c0c0c0c0c0c0c0c0", "w@b.co", time.Hour)
+	friend, _ := util.GenerateTabGuestToken("65f0c0c0c0c0c0c0c0c0c0c0", "RES-AAAA-1", "abcdefghijkl", "g1", time.Hour)
+
+	send := func(method, path, token string) int {
+		req := httptest.NewRequest(method, apiPrefix+path, strings.NewReader("{}"))
+		if token != "" {
+			req.Header.Set("Authorization", "Bearer "+token)
+		}
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, req)
+		return rec.Code
+	}
+
+	// Nobody can share or stop sharing someone else's booking.
+	for _, method := range []string{"GET", "POST", "DELETE"} {
+		path := "/users/" + other + "/reservations/RES-AAAA-1/tab"
+		for _, tok := range []string{token, waiter, friend} {
+			if code := send(method, path, tok); code != http.StatusForbidden {
+				t.Errorf("%s %s with another account's token: got %d, want 403", method, path, code)
+			}
+		}
+	}
+
+	// Sharing from a QR visit needs that visit's own token.
+	for _, method := range []string{"POST", "DELETE"} {
+		for _, tok := range []string{"", "garbage", token, waiter} {
+			if code := send(method, "/dine/visit/tab", tok); code != http.StatusUnauthorized {
+				t.Errorf("%s /dine/visit/tab with token %q: got %d, want 401", method, tok[:min(len(tok), 8)], code)
+			}
+		}
+	}
+
+	// A link with a malformed code is refused before any lookup.
+	for _, path := range []string{"/tab/short", "/tab/" + strings.Repeat("x", 40)} {
+		if code := send("GET", path, ""); code != http.StatusNotFound {
+			t.Errorf("GET %s: got %d, want 404", path, code)
+		}
+	}
+	if code := send("POST", "/tab/abcdefghijkl/join", ""); code != http.StatusBadRequest {
+		t.Errorf("joining without a name: got %d, want 400", code)
+	}
+
+	// A friend's token cannot reach the host's account or the floor.
+	for _, path := range []string{"/users/" + host + "/orders", "/waiters/restaurants/65f0c0c0c0c0c0c0c0c0c0c0/orders"} {
+		if code := send("GET", path, friend); code != http.StatusForbidden {
+			t.Errorf("GET %s with a friend's token: got %d, want 403", path, code)
+		}
+	}
+}

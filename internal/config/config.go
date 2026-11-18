@@ -51,6 +51,10 @@ type Config struct {
 	RequireMobileAuth bool
 
 	SMTP SMTPConfig
+
+	// WebURL is the public website, used to build links people share
+	// (WEB_URL, default https://www.swiftab.co.ke).
+	WebURL string
 }
 
 func (c *Config) IsProd() bool {
@@ -103,6 +107,7 @@ func LoadConfig() *Config {
 		CookieDomain:      cookieDomain,
 		Location:          loc,
 		RequireMobileAuth: strings.EqualFold(os.Getenv("REQUIRE_MOBILE_AUTH"), "true"),
+		WebURL:            strings.TrimRight(getenv("WEB_URL", "https://www.swiftab.co.ke"), "/"),
 		SMTP: SMTPConfig{
 			Host: os.Getenv("SMTP_HOST"),
 			Port: getenv("SMTP_PORT", "587"),

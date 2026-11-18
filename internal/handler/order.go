@@ -118,13 +118,13 @@ func priceItems(requested []models.MenuItem, menu map[bson.ObjectID]models.MenuI
 }
 
 // mergeItems adds new lines to an order's existing lines, combining a dish
-// that is already on the order.
+// that is already on the order for the same person with the same note.
 func mergeItems(existing, added []models.MenuItem) []models.MenuItem {
 	out := append([]models.MenuItem{}, existing...)
 	for _, line := range added {
 		merged := false
 		for i := range out {
-			if out[i].ID == line.ID && out[i].Note == line.Note {
+			if out[i].ID == line.ID && out[i].Note == line.Note && out[i].AddedByID == line.AddedByID {
 				out[i].Quantity += line.Quantity
 				merged = true
 				break
@@ -197,14 +197,18 @@ func (h *OrderHandler) CreateOrder(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	h.placeOrder(w, r, &reservation, req.Menu, req.TableNumber)
+	h.placeOrder(w, r, &reservation, req.Menu, req.TableNumber, nil)
 }
 
 // placeOrder prices the requested dishes from the restaurant's own menu and
 // adds them to the booking's open order, or starts a new one. It is shared by
 // the diner app and by guests who checked in with a table's QR code.
 // fallbackTable is used only for old bookings that have no table recorded.
-func (h *OrderHandler) placeOrder(w http.ResponseWriter, r *http.Request, reservation *models.Reservation, menu []models.MenuItem, fallbackTable string) {
+//
+// friend is the guest who is ordering on a host's shared tab, or nil when the
+// host orders. Their lines are marked with their name so everyone can see
+// who ordered what, and the host is told.
+func (h *OrderHandler) placeOrder(w http.ResponseWriter, r *http.Request, reservation *models.Reservation, menu []models.MenuItem, fallbackTable string, friend *models.TabGuest) {
 	restID := reservation.RestaurantID
 	restaurant, err := h.loadRestaurant(r.Context(), restID)
 	if err != nil || len(restaurant.Data) == 0 {
@@ -216,6 +220,12 @@ func (h *OrderHandler) placeOrder(w http.ResponseWriter, r *http.Request, reserv
 	if err != nil {
 		util.JsonError(w, http.StatusBadRequest, err.Error())
 		return
+	}
+	if friend != nil {
+		for i := range lines {
+			lines[i].AddedBy = friend.Name
+			lines[i].AddedByID = friend.ID
+		}
 	}
 
 	// The table and restaurant name come from the booking, not the request.
@@ -262,6 +272,9 @@ func (h *OrderHandler) placeOrder(w http.ResponseWriter, r *http.Request, reserv
 				Channel: "orders",
 			})
 
+			if friend != nil {
+				go h.tellHost(*reservation, *friend, lines, linesTotal)
+			}
 			open.Items = items
 			open.TotalAmount = orderTotal(items)
 			open.OrderStatus = models.OrderPlaced
@@ -311,6 +324,9 @@ func (h *OrderHandler) placeOrder(w http.ResponseWriter, r *http.Request, reserv
 		Channel: "orders",
 	})
 
+	if friend != nil {
+		go h.tellHost(*reservation, *friend, lines, linesTotal)
+	}
 	util.JsonResponse(w, http.StatusCreated, map[string]interface{}{
 		"message": "Order created successfully",
 		"order":   newOrder,

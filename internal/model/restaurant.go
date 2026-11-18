@@ -176,6 +176,10 @@ type MenuItem struct {
 	PrepTime  int      `bson:"prepTime,omitempty" json:"prepTime,omitempty"`
 	// Note is a diner's instruction for the kitchen; only set on order lines.
 	Note string `bson:"note,omitempty" json:"note,omitempty"`
+	// AddedBy names the friend who put this line on a shared tab, and
+	// AddedByID is their guest id. Both are empty for the host's own dishes.
+	AddedBy   string `bson:"addedBy,omitempty" json:"addedBy,omitempty"`
+	AddedByID string `bson:"addedById,omitempty" json:"addedById,omitempty"`
 }
 
 // IsAvailable reports whether the item can currently be ordered.

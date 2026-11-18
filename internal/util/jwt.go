@@ -38,6 +38,10 @@ type Claims struct {
 	WaiterID     string `json:"waiterId,omitempty"`
 	// ReservationID is the visit a guest token is limited to (RES-...).
 	ReservationID string `json:"reservationId,omitempty"`
+	// TabCode and GuestID are set for a friend who joined a shared tab: the
+	// token stops working when the host closes the tab (its code changes).
+	TabCode string `json:"tabCode,omitempty"`
+	GuestID string `json:"guestId,omitempty"`
 	jwt.RegisteredClaims
 }
 
@@ -86,6 +90,18 @@ func GenerateGuestToken(restaurantID, reservationID string, expiry time.Duration
 	return sign(Claims{
 		RestaurantID:  restaurantID,
 		ReservationID: reservationID,
+		Role:          RoleGuest,
+	}, expiry)
+}
+
+// GenerateTabGuestToken issues a token for a friend who joined a host's
+// shared tab. It can read the menu and add dishes to that booking only.
+func GenerateTabGuestToken(restaurantID, reservationID, tabCode, guestID string, expiry time.Duration) (string, error) {
+	return sign(Claims{
+		RestaurantID:  restaurantID,
+		ReservationID: reservationID,
+		TabCode:       tabCode,
+		GuestID:       guestID,
 		Role:          RoleGuest,
 	}, expiry)
 }
