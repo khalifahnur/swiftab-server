@@ -273,7 +273,7 @@ func (h *OrderHandler) placeOrder(w http.ResponseWriter, r *http.Request, reserv
 			})
 
 			if friend != nil {
-				go h.tellHost(*reservation, *friend, lines, linesTotal)
+				go h.tellHost(*reservation, *friend, open.ID, lines, linesTotal)
 			}
 			open.Items = items
 			open.TotalAmount = orderTotal(items)
@@ -325,7 +325,7 @@ func (h *OrderHandler) placeOrder(w http.ResponseWriter, r *http.Request, reserv
 	})
 
 	if friend != nil {
-		go h.tellHost(*reservation, *friend, lines, linesTotal)
+		go h.tellHost(*reservation, *friend, newOrder.ID, lines, linesTotal)
 	}
 	util.JsonResponse(w, http.StatusCreated, map[string]interface{}{
 		"message": "Order created successfully",

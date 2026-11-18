@@ -347,7 +347,7 @@ func (h *DineHandler) JoinTab(w http.ResponseWriter, r *http.Request) {
 
 // tellHost lets the host know a friend put dishes on their tab. It runs after
 // the order is saved and must not use the request's context.
-func (h *OrderHandler) tellHost(res models.Reservation, friend models.TabGuest, lines []models.MenuItem, total float64) {
+func (h *OrderHandler) tellHost(res models.Reservation, friend models.TabGuest, orderID bson.ObjectID, lines []models.MenuItem, total float64) {
 	count := 0
 	for _, line := range lines {
 		count += max(line.Quantity, 1)
@@ -359,7 +359,7 @@ func (h *OrderHandler) tellHost(res models.Reservation, friend models.TabGuest, 
 	h.notifyUser(res.UserID, util.PushMessage{
 		Title:   friend.Name + " added to your tab",
 		Body:    fmt.Sprintf("%s · KES %.0f at %s.", what, total, res.ReservationInfo.RestaurantName),
-		Data:    map[string]string{"type": "tab", "reservationId": res.ReservationInfo.ReservationID},
+		Data:    map[string]string{"type": "tab", "orderId": orderID.Hex(), "reservationId": res.ReservationInfo.ReservationID},
 		Channel: "orders",
 	})
 }
