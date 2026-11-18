@@ -66,6 +66,7 @@ var adminRoutes = []struct{ method, path string }{
 	{"POST", "/admin/promotions"},
 	{"PUT", "/admin/promotions/65f0c0c0c0c0c0c0c0c0c0c0"},
 	{"DELETE", "/admin/promotions/65f0c0c0c0c0c0c0c0c0c0c0"},
+	{"GET", "/admin/tables/qr"},
 }
 
 func TestAdminRoutesRequireASession(t *testing.T) {
@@ -256,5 +257,71 @@ func TestCORS(t *testing.T) {
 	}
 	if !strings.Contains(rec.Header().Get("Access-Control-Allow-Methods"), "PUT") {
 		t.Errorf("preflight does not allow PUT: %q", rec.Header().Get("Access-Control-Allow-Methods"))
+	}
+}
+
+func TestTableQRLinksNeedTheirCode(t *testing.T) {
+	mux := testRouter(false)
+	const rest = "65f0c0c0c0c0c0c0c0c0c0c0"
+	for _, tc := range []struct{ method, path, body string }{
+		{"GET", "/dine/tables/" + rest + "/t-1", ""},
+		{"GET", "/dine/tables/" + rest + "/t-1?code=made-up", ""},
+		{"GET", "/dine/tables/" + rest + "/t-2?code=" + util.TableCode(rest, "t-1"), ""},
+		{"POST", "/dine/tables/" + rest + "/t-1/checkin", `{"code":"made-up","name":"Ann"}`},
+	} {
+		req := httptest.NewRequest(tc.method, apiPrefix+tc.path, strings.NewReader(tc.body))
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, req)
+		if rec.Code != http.StatusNotFound {
+			t.Errorf("%s %s: got %d, want 404", tc.method, tc.path, rec.Code)
+		}
+	}
+}
+
+func TestGuestRoutesNeedAGuestToken(t *testing.T) {
+	mux := testRouter(false)
+	userToken, _ := util.GenerateUserToken("65f0c0c0c0c0c0c0c0c0c0c1", "a@b.co", time.Hour)
+	waiterToken, _ := util.GenerateWaiterToken("65f0c0c0c0c0c0c0c0c0c0c2", "65f0c0c0c0c0c0c0c0c0c0c0", "w@b.co", time.Hour)
+	for _, token := range []string{"", "garbage", userToken, waiterToken} {
+		for _, rt := range []struct{ method, path string }{
+			{"GET", "/dine/visit"},
+			{"POST", "/dine/visit/orders"},
+			{"PUT", "/dine/visit/orders/65f0c0c0c0c0c0c0c0c0c0c3/bill"},
+			{"PUT", "/dine/visit/orders/65f0c0c0c0c0c0c0c0c0c0c3/cancel"},
+		} {
+			req := httptest.NewRequest(rt.method, apiPrefix+rt.path, strings.NewReader("{}"))
+			if token != "" {
+				req.Header.Set("Authorization", "Bearer "+token)
+			}
+			rec := httptest.NewRecorder()
+			mux.ServeHTTP(rec, req)
+			if rec.Code != http.StatusUnauthorized {
+				t.Errorf("%s %s with token %q: got %d, want 401", rt.method, rt.path, token[:min(len(token), 8)], rec.Code)
+			}
+		}
+	}
+}
+
+func TestGuestTokenCannotOpenDinerOrWaiterRoutes(t *testing.T) {
+	mux := testRouter(false)
+	guest, _ := util.GenerateGuestToken("65f0c0c0c0c0c0c0c0c0c0c0", "RES-AAAA-1", time.Hour)
+	for _, path := range []string{
+		"/users/65f0c0c0c0c0c0c0c0c0c0c1/orders",
+		"/waiters/restaurants/65f0c0c0c0c0c0c0c0c0c0c0/orders?tab=served",
+	} {
+		req := httptest.NewRequest("GET", apiPrefix+path, nil)
+		req.Header.Set("Authorization", "Bearer "+guest)
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, req)
+		if rec.Code != http.StatusForbidden {
+			t.Errorf("GET %s with a guest token: got %d, want 403", path, rec.Code)
+		}
+	}
+	req := httptest.NewRequest("GET", apiPrefix+"/admin/orders", nil)
+	req.Header.Set("Authorization", "Bearer "+guest)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Errorf("GET /admin/orders with a guest token: got %d, want 401", rec.Code)
 	}
 }

@@ -197,13 +197,22 @@ func (h *OrderHandler) CreateOrder(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	h.placeOrder(w, r, &reservation, req.Menu, req.TableNumber)
+}
+
+// placeOrder prices the requested dishes from the restaurant's own menu and
+// adds them to the booking's open order, or starts a new one. It is shared by
+// the diner app and by guests who checked in with a table's QR code.
+// fallbackTable is used only for old bookings that have no table recorded.
+func (h *OrderHandler) placeOrder(w http.ResponseWriter, r *http.Request, reservation *models.Reservation, menu []models.MenuItem, fallbackTable string) {
+	restID := reservation.RestaurantID
 	restaurant, err := h.loadRestaurant(r.Context(), restID)
 	if err != nil || len(restaurant.Data) == 0 {
 		util.JsonError(w, http.StatusNotFound, "Restaurant not found")
 		return
 	}
 
-	lines, linesTotal, err := priceItems(req.Menu, menuIndex(restaurant.Data[0]))
+	lines, linesTotal, err := priceItems(menu, menuIndex(restaurant.Data[0]))
 	if err != nil {
 		util.JsonError(w, http.StatusBadRequest, err.Error())
 		return
@@ -212,7 +221,7 @@ func (h *OrderHandler) CreateOrder(w http.ResponseWriter, r *http.Request) {
 	// The table and restaurant name come from the booking, not the request.
 	tableNumber := reservation.ReservationInfo.TableNumber
 	if tableNumber == "" {
-		tableNumber = strings.TrimSpace(req.TableNumber)
+		tableNumber = strings.TrimSpace(fallbackTable)
 	}
 	if tableNumber == "" {
 		util.JsonError(w, http.StatusBadRequest, "This reservation has no table assigned")
@@ -269,9 +278,9 @@ func (h *OrderHandler) CreateOrder(w http.ResponseWriter, r *http.Request) {
 		ID:             bson.NewObjectID(),
 		OrderNumber:    util.GenerateOrderID(restID.Hex()),
 		RestaurantName: restaurantName,
-		UserID:         userID,
+		UserID:         reservation.UserID,
 		RestaurantID:   restID,
-		ReservationID:  req.ReservationID,
+		ReservationID:  reservation.ReservationInfo.ReservationID,
 		TableNumber:    tableNumber,
 		Guests:         reservation.ReservationInfo.Guests,
 		Items:          lines,
@@ -330,11 +339,14 @@ func (h *OrderHandler) loadUserOrder(w http.ResponseWriter, r *http.Request) *mo
 // UserCompleteOrder is the diner asking for the bill and saying how they
 // will pay. The waiter confirms the payment afterwards.
 func (h *OrderHandler) UserCompleteOrder(w http.ResponseWriter, r *http.Request) {
-	order := h.loadUserOrder(w, r)
-	if order == nil {
-		return
+	if order := h.loadUserOrder(w, r); order != nil {
+		h.requestBill(w, r, order)
 	}
+}
 
+// requestBill moves an order the caller may act on to "ready to pay" with the
+// payment method they chose, and tells the waiters.
+func (h *OrderHandler) requestBill(w http.ResponseWriter, r *http.Request, order *models.Order) {
 	var reqBody struct {
 		Status        string `json:"status"`
 		PaymentMethod string `json:"paymentMethod"`
@@ -386,10 +398,14 @@ func (h *OrderHandler) UserCompleteOrder(w http.ResponseWriter, r *http.Request)
 
 // UserCancelOrder lets a diner cancel an order nobody has started serving.
 func (h *OrderHandler) UserCancelOrder(w http.ResponseWriter, r *http.Request) {
-	order := h.loadUserOrder(w, r)
-	if order == nil {
-		return
+	if order := h.loadUserOrder(w, r); order != nil {
+		h.cancelPlacedOrder(w, r, order)
 	}
+}
+
+// cancelPlacedOrder cancels an order the caller may act on, as long as
+// nobody has started serving it.
+func (h *OrderHandler) cancelPlacedOrder(w http.ResponseWriter, r *http.Request, order *models.Order) {
 	if order.OrderStatus != models.OrderPlaced {
 		util.JsonError(w, http.StatusConflict, "This order is already being served. Ask your waiter for help.")
 		return

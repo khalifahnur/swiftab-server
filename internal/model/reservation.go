@@ -47,6 +47,9 @@ type Reservation struct {
 	ReservationInfo ReservationInfo   `bson:"reservationInfo" json:"reservationInfo"`
 	UserOrder       *bson.ObjectID    `bson:"userOrder,omitempty" json:"userOrder,omitempty"`
 	Status          ReservationStatus `bson:"status" json:"status"`
-	CreatedAt       time.Time         `bson:"createdAt" json:"createdAt"`
-	UpdatedAt       time.Time         `bson:"updatedAt" json:"updatedAt"`
+	// Source is "qr" for a guest who checked in by scanning a table's QR
+	// code; empty for bookings made in the app or by the restaurant.
+	Source    string    `bson:"source,omitempty" json:"source,omitempty"`
+	CreatedAt time.Time `bson:"createdAt" json:"createdAt"`
+	UpdatedAt time.Time `bson:"updatedAt" json:"updatedAt"`
 }

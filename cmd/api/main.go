@@ -96,6 +96,7 @@ func newRouter(base *handler.Base, auth *middleware.Auth) *http.ServeMux {
 	reservations := &handler.ReservationHandler{Base: base}
 	orders := &handler.OrderHandler{Base: base}
 	promotions := &handler.PromotionHandler{Base: base}
+	dine := &handler.DineHandler{Base: base, Orders: orders}
 
 	mux := http.NewServeMux()
 
@@ -159,6 +160,8 @@ func newRouter(base *handler.Base, auth *middleware.Auth) *http.ServeMux {
 	route("GET /admin/reservations", reservations.FetchReservations, auth.Admin)
 	route("PUT /admin/reservations/{id}/status", reservations.AdminUpdateReservation, auth.Admin)
 
+	route("GET /admin/tables/qr", dine.TableCodes, auth.Admin)
+
 	route("GET /admin/promotions", promotions.List, auth.Admin)
 	route("POST /admin/promotions", promotions.Create, auth.Admin)
 	route("PUT /admin/promotions/{id}", promotions.Update, auth.Admin)
@@ -197,6 +200,16 @@ func newRouter(base *handler.Base, auth *middleware.Auth) *http.ServeMux {
 	route("GET /users/{userId}/orders", orders.GetUserOrders, auth.Mobile)
 	route("PUT /users/orders/{orderId}/complete", orders.UserCompleteOrder, auth.Mobile)
 	route("PUT /users/orders/{orderId}/cancel", orders.UserCancelOrder, auth.Mobile)
+
+	// --- Guests who scan a table's QR code ---------------------------------------
+	// The code in the link is checked on every table request; after check-in
+	// the guest token only reaches that one visit.
+	route("GET /dine/tables/{restaurantId}/{tableId}", dine.Table)
+	route("POST /dine/tables/{restaurantId}/{tableId}/checkin", dine.CheckIn)
+	route("GET /dine/visit", dine.Visit)
+	route("POST /dine/visit/orders", dine.PlaceOrder)
+	route("PUT /dine/visit/orders/{orderId}/bill", dine.RequestBill)
+	route("PUT /dine/visit/orders/{orderId}/cancel", dine.CancelOrder)
 
 	// --- Waiter app ----------------------------------------------------------
 	route("GET /waiters/restaurants/{restaurantId}/orders", orders.GetWaiterOrders, auth.Mobile)

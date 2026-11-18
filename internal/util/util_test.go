@@ -152,3 +152,24 @@ func TestMailerDisabledWithoutSMTP(t *testing.T) {
 		t.Errorf("Send without SMTP = %v, want ErrMailDisabled", err)
 	}
 }
+
+func TestTableCode(t *testing.T) {
+	code := TableCode("65f0c0c0c0c0c0c0c0c0c0c0", "t-1")
+	if len(code) != 16 || !ValidTableCode("65f0c0c0c0c0c0c0c0c0c0c0", "t-1", code) {
+		t.Fatalf("code %q does not validate", code)
+	}
+	if ValidTableCode("65f0c0c0c0c0c0c0c0c0c0c0", "t-2", code) || ValidTableCode("65f0c0c0c0c0c0c0c0c0c0c1", "t-1", code) {
+		t.Fatal("a code works for another table")
+	}
+	if ValidTableCode("65f0c0c0c0c0c0c0c0c0c0c0", "t-1", "") {
+		t.Fatal("an empty code validates")
+	}
+}
+
+func TestPhoneDigits(t *testing.T) {
+	for _, in := range []string{"+254 712 345 678", "0712345678", "712345678", "254712345678", "0712-345-678"} {
+		if got := PhoneDigits(in); got != "712345678" {
+			t.Errorf("PhoneDigits(%q) = %q", in, got)
+		}
+	}
+}
