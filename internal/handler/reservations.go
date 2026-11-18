@@ -244,6 +244,8 @@ func (h *ReservationHandler) userReservations(w http.ResponseWriter, r *http.Req
 			"rate":           restRate,
 			"restaurantId":   agg.RestaurantID.Hex(),
 			"hasOrder":       agg.UserOrder != nil,
+			"sharing":        agg.Tab.IsOpen(),
+			"tabGuests":      tabGuestCount(agg.Tab),
 		})
 	}
 
@@ -628,4 +630,12 @@ func (h *ReservationHandler) UpdateStatusByUser(w http.ResponseWriter, r *http.R
 		"reservationId": existing.ReservationInfo.ReservationID,
 		"status":        models.ReservationCancelled,
 	})
+}
+
+// tabGuestCount is how many friends joined a booking's shared tab.
+func tabGuestCount(tab *models.Tab) int {
+	if !tab.IsOpen() {
+		return 0
+	}
+	return len(tab.Guests)
 }

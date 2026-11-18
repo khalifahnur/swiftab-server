@@ -44,6 +44,8 @@ func EnsureIndexes(db *mongo.Database) {
 			{Keys: bson.D{{Key: "restaurantId", Value: 1}, {Key: "reservationInfo.bookingFor", Value: 1}}},
 			{Keys: bson.D{{Key: "userId", Value: 1}, {Key: "status", Value: 1}}},
 			{Keys: bson.D{{Key: "reservationInfo.reservationID", Value: 1}}},
+			// Finds the booking behind a shared tab link.
+			{Keys: bson.D{{Key: "tab.code", Value: 1}}, Options: options.Index().SetSparse(true)},
 		},
 		"restaurantlayouts": {
 			{Keys: bson.D{{Key: "restaurantId", Value: 1}}},

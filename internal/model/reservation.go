@@ -49,7 +49,49 @@ type Reservation struct {
 	Status          ReservationStatus `bson:"status" json:"status"`
 	// Source is "qr" for a guest who checked in by scanning a table's QR
 	// code; empty for bookings made in the app or by the restaurant.
-	Source    string    `bson:"source,omitempty" json:"source,omitempty"`
+	Source string `bson:"source,omitempty" json:"source,omitempty"`
+	// Tab is set while the host shares their menu so friends can add dishes
+	// to this booking's bill.
+	Tab       *Tab      `bson:"tab,omitempty" json:"-"`
 	CreatedAt time.Time `bson:"createdAt" json:"createdAt"`
 	UpdatedAt time.Time `bson:"updatedAt" json:"updatedAt"`
+}
+
+// MaxTabGuests caps how many friends can join one shared tab.
+const MaxTabGuests = 20
+
+// Tab is a booking's share link. Friends who open it say who they are and
+// can then order dishes that go on the host's bill.
+type Tab struct {
+	// Code is the secret in the share link. Closing the tab clears it, so an
+	// old link stops working; sharing again makes a new one.
+	Code     string     `bson:"code,omitempty"`
+	Open     bool       `bson:"open"`
+	OpenedAt time.Time  `bson:"openedAt"`
+	Guests   []TabGuest `bson:"guests,omitempty"`
+}
+
+// TabGuest is a friend who joined a shared tab.
+type TabGuest struct {
+	ID       string    `bson:"id" json:"id"`
+	Name     string    `bson:"name" json:"name"`
+	JoinedAt time.Time `bson:"joinedAt" json:"joinedAt"`
+}
+
+// IsOpen reports whether the share link currently works.
+func (t *Tab) IsOpen() bool {
+	return t != nil && t.Open && t.Code != ""
+}
+
+// Guest finds a friend on the tab by id.
+func (t *Tab) Guest(id string) *TabGuest {
+	if t == nil || id == "" {
+		return nil
+	}
+	for i := range t.Guests {
+		if t.Guests[i].ID == id {
+			return &t.Guests[i]
+		}
+	}
+	return nil
 }
