@@ -15,6 +15,9 @@ const (
 	RoleUser   = "user"
 	// RoleReset marks a short-lived token that only authorises a password reset.
 	RoleReset = "password_reset"
+	// RoleGuest is a diner who checked in by scanning a table's QR code. The
+	// token is good for that one visit only: it names the booking, not an account.
+	RoleGuest = "guest"
 )
 
 func getJWTSecret() []byte {
@@ -33,6 +36,8 @@ type Claims struct {
 	Role         string `json:"role,omitempty"`
 	UserID       string `json:"userId,omitempty"`
 	WaiterID     string `json:"waiterId,omitempty"`
+	// ReservationID is the visit a guest token is limited to (RES-...).
+	ReservationID string `json:"reservationId,omitempty"`
 	jwt.RegisteredClaims
 }
 
@@ -72,6 +77,16 @@ func GenerateUserToken(userID, email string, expiry time.Duration) (string, erro
 		UserID: userID,
 		Email:  email,
 		Role:   RoleUser,
+	}, expiry)
+}
+
+// GenerateGuestToken issues a token for a guest seated at a table through
+// its QR code. It only opens that visit's menu, orders and bill.
+func GenerateGuestToken(restaurantID, reservationID string, expiry time.Duration) (string, error) {
+	return sign(Claims{
+		RestaurantID:  restaurantID,
+		ReservationID: reservationID,
+		Role:          RoleGuest,
 	}, expiry)
 }
 
